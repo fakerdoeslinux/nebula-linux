@@ -1,7 +1,7 @@
 # Super Mario Galaxy — native Linux port (Nebula)
 
 A ready-to-run Linux build of [Nebula](https://github.com/keepvaibin/nebula), the decompilation of *Super Mario
-Galaxy*, plus the four source patches, build scripts and desktop entry this port needs.
+Galaxy*, plus the five source changes, build scripts and desktop entry this port needs.
 
 No Wine. No emulator. The game's code is compiled to a native Linux binary and runs on SDL3 + Vulkan.
 
