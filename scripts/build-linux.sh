@@ -156,6 +156,13 @@ install -m755 "$BUILD/host/nebula" "$NEBULA_HOME/bin/nebula"
 install -m755 "$BUILD/game/libsmg_game.so" "$NEBULA_HOME/bin/libsmg_game.so"
 cp -f "$BUILD/host/SDL3"/libSDL3.so* "$NEBULA_HOME/bin/" 2>/dev/null || true
 install -m755 "$REPO/scripts/run-nebula.sh" "$NEBULA_HOME/bin/run-nebula.sh"
+install -m755 "$REPO/scripts/set-video.sh" "$NEBULA_HOME/bin/set-video.sh"
+
+# 2560x1080 ultrawide, Hor+, FSR 1 quality and 120 presented frames unless a config.ini already exists.
+if [ ! -f "$NEBULA_HOME/data/config.ini" ]; then
+  NEBULA_HOME="$NEBULA_HOME" bash "$REPO/scripts/set-video.sh" --res "${NEBULA_RES:-2560x1080}" --aspect auto \
+    --fsr "${NEBULA_FSR:-quality}" --fps "${NEBULA_FPS:-120}" --display borderless
+fi
 
 if [ -n "$DISC" ]; then
   [ -f "$DISC" ] || die "no disc image at $DISC"
