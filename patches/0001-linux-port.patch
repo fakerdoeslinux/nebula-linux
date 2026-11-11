@@ -1,0 +1,87 @@
+diff --git a/cmake/archive_deps.cmake b/cmake/archive_deps.cmake
+index bc15be8..940541f 100644
+--- a/cmake/archive_deps.cmake
++++ b/cmake/archive_deps.cmake
+@@ -32,6 +32,12 @@ function(nebula_archive_dep name source)
+     if(CMAKE_OSX_DEPLOYMENT_TARGET)
+         list(APPEND toolchain "-DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+     endif()
++    # Fedora-style multilibs install static archives into lib64, while the libraries the build links are named
++    # under lib/ below. Windows already installs into lib.
++    set(libdir)
++    if(NOT WIN32)
++        set(libdir "-DCMAKE_INSTALL_LIBDIR=lib")
++    endif()
+     execute_process(
+         COMMAND "${CMAKE_COMMAND}" -S "${source}" -B "${build}" -G "${CMAKE_GENERATOR}"
+                 "-DCMAKE_BUILD_TYPE=Release"
+@@ -40,6 +46,7 @@ function(nebula_archive_dep name source)
+                 "-DCMAKE_PREFIX_PATH=${NEBULA_ARCHIVE_PREFIX}"
+                 "-DCMAKE_POSITION_INDEPENDENT_CODE=ON"
+                 "-DBUILD_SHARED_LIBS=OFF"
++                ${libdir}
+                 ${toolchain} ${ARGN}
+         RESULT_VARIABLE result OUTPUT_QUIET ERROR_VARIABLE errors)
+     if(NOT result EQUAL 0)
+diff --git a/native/math/src/nebula_libc.c b/native/math/src/nebula_libc.c
+index cb8eab8..f1ff892 100644
+--- a/native/math/src/nebula_libc.c
++++ b/native/math/src/nebula_libc.c
+@@ -5,6 +5,18 @@
+ #include <stdint.h>
+ #include <wchar.h>
+ 
++/* glibc declares strchr, strrchr and strstr as type-generic macros in <string.h> (pulled in by nebula_prelude.h); the
++   definitions below are the module's own, as on Windows. */
++#ifdef strchr
++#undef strchr
++#endif
++#ifdef strrchr
++#undef strrchr
++#endif
++#ifdef strstr
++#undef strstr
++#endif
++
+ typedef uint64_t __attribute__((may_alias, aligned(1))) Word;
+ 
+ void* memcpy(void* pDst, const void* pSrc, size_t size) {
+diff --git a/platform/sdl/host_window_sdl.cpp b/platform/sdl/host_window_sdl.cpp
+index 3db51a7..dbe5673 100644
+--- a/platform/sdl/host_window_sdl.cpp
++++ b/platform/sdl/host_window_sdl.cpp
+@@ -1849,7 +1849,7 @@ std::optional<input::DeviceKey> last_input_device() noexcept {
+     return std::nullopt;
+ }
+ 
+-void arm_controller_binding_capture(input::ControlScheme scheme, std::uint8_t slot) noexcept {
++void arm_controller_binding_capture(input::ControlScheme scheme, std::uint32_t slot) noexcept {
+     const std::lock_guard<std::mutex> lock(galaxy::sdl::g_input_mutex);
+     galaxy::sdl::g_capture_result.reset();
+     galaxy::sdl::g_capture_device = input::DeviceKey{scheme, slot};
+diff --git a/runtime/src/render/core/draw_walker.cpp b/runtime/src/render/core/draw_walker.cpp
+index 82ad286..944865a 100644
+--- a/runtime/src/render/core/draw_walker.cpp
++++ b/runtime/src/render/core/draw_walker.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "galaxy/cpu_count.h"
+ #include "galaxy/frame_timeline.h"
++#include "galaxy/launch_args.h"
+ #include "galaxy/loss_report.h"
+ #include "galaxy/render/render_config.h"
+ #include "galaxy/run_options.h"
+diff --git a/runtime/src/render/frame_pass.cpp b/runtime/src/render/frame_pass.cpp
+index b9d9831..5cfe68f 100644
+--- a/runtime/src/render/frame_pass.cpp
++++ b/runtime/src/render/frame_pass.cpp
+@@ -2,7 +2,9 @@
+ // helpers.
+ 
+ #include "galaxy/render/frame_pass.h"
++#if !defined(NEBULA_GPU_VULKAN)
+ #include "barriers_d3d12.h"
++#endif
+ #include "galaxy/render/render_config.h"
+ #include "galaxy/render/renderer_common.h"
+ #if !defined(NEBULA_GPU_VULKAN)

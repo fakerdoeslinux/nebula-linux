@@ -1,0 +1,8 @@
+# build trees, content and saves never belong in the repo
+build/
+out/
+*.pak
+*.rvz
+*.iso
+*.wbfs
+*.log
