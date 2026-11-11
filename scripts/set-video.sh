@@ -9,6 +9,7 @@
 #   --fps N             presented frames per second: 60, 120, 144, 0 (the display's rate)
 #   --display MODE      windowed | borderless
 #   --sharpness N       RCAS strength 0-100, 0 skips the pass
+#   --hud on|off        draw HUD and menus at the output resolution (crisper text, ~0.5-1.2 ms more)
 #
 # NEBULA_HOME names the install root (default ~/Documents/nebula-game); the settings folder is its data/.
 set -euo pipefail
@@ -19,7 +20,7 @@ CONFIG="$DATA/config.ini"
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-res="" aspect="" fsr="" fps="" display="" sharpness=""
+res="" aspect="" fsr="" fps="" display="" sharpness="" hud=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --res)       res="${2:?--res needs WxH}"; shift 2 ;;
@@ -28,6 +29,7 @@ while [[ $# -gt 0 ]]; do
     --fps)       fps="${2:?--fps needs a number}"; shift 2 ;;
     --display)   display="${2:?--display needs windowed or borderless}"; shift 2 ;;
     --sharpness) sharpness="${2:?--sharpness needs a number}"; shift 2 ;;
+    --hud)       hud="${2:?--hud needs on or off}"; shift 2 ;;
     -h|--help)   sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)           die "unknown option $1" ;;
   esac
@@ -92,5 +94,13 @@ if [[ -n "$sharpness" ]]; then
   set_key sharpness "$sharpness"
 fi
 
+if [[ -n "$hud" ]]; then
+  case "$hud" in
+    on)  set_key hud_output_resolution 1 ;;
+    off) set_key hud_output_resolution 0 ;;
+    *) die "--hud wants on or off" ;;
+  esac
+fi
+
 printf '%s\n' "$CONFIG" >&2
-grep -E '^(window_width|window_height|display_mode|aspect|upscaler|spatial_quality|max_fps|sharpness)=' "$CONFIG" | sed 's/^/  /' >&2
+grep -E '^(window_width|window_height|display_mode|aspect|upscaler|spatial_quality|max_fps|sharpness|hud_output_resolution)=' "$CONFIG" | sed 's/^/  /' >&2

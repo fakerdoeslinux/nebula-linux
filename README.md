@@ -69,6 +69,8 @@ and the new layout.
   2548x1042 back buffer, with the HUD and menus still drawn at full output resolution.
 - `--fps 120` presents 120 frames a second from the game's 60, with Nebula's own interpolation between them on the
   190 Hz panel this was tested on. `--fps 60` for the plain 1:1 cadence, `--fps 0` for the display's rate.
+- `--hud on` draws the HUD, menus and text at the full output resolution instead of the scene target: crisper, and
+  measured at +0.5-1.2 ms a frame. `--sharpness 20` adds RCAS on top if you want the upscale to bite harder.
 
 Measured on Ryzen 5 3550H + Radeon Vega 8 (RADV RAVEN, Mesa 26.2.6), GPU milliseconds per presented frame from the
 `[vk-gpu] frame` line:
@@ -90,7 +92,7 @@ back buffer. Set the panel to *Windows can cover* (or auto-hide) and it is the f
 The same knobs are environment variables on the launcher, for one-off runs without touching the file:
 
 ```bash
-NEBULA_RES=2560x1080 NEBULA_FSR=performance NEBULA_FPS=144 bash scripts/run-nebula.sh
+NEBULA_RES=2560x1080 NEBULA_FSR=performance NEBULA_FPS=144 NEBULA_HUD=on bash scripts/run-nebula.sh
 ```
 
 ### Distribution setup for the build
