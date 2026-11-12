@@ -23,6 +23,65 @@ index bc15be8..940541f 100644
                  ${toolchain} ${ARGN}
          RESULT_VARIABLE result OUTPUT_QUIET ERROR_VARIABLE errors)
      if(NOT result EQUAL 0)
+diff --git a/native/host/host_main.cpp b/native/host/host_main.cpp
+index 41f607e..7471dfe 100644
+--- a/native/host/host_main.cpp
++++ b/native/host/host_main.cpp
+@@ -2309,6 +2309,25 @@ bool gPipelinesPrepared = false;
+ #endif
+ fs::path gModsProgressFile;
+ 
++// NEBULA_OPTION_FPS: the presents the swap chain got over the renderer's last one-second window, the measure the menu's
++// FRAME RATE row shows (host_window::measured_present_hz), with frame generation's extra presents counted in. Tenths,
++// so 59.9 and 60.0 differ. The renderer counts every present, so this is the picture's rate on the display, not the
++// game's step rate: with interpolation or a frame-rate limit above 60 they differ by design.
++uint32_t sampled_fps_tenths() {
++#if defined(NEBULA_HOST_RENDERER)
++    double hz = galaxy::render::host_window::measured_present_hz.load(std::memory_order_relaxed);
++    if (galaxy::render::frame_generation_running()) {
++        hz *= static_cast<double>(galaxy::render::host_window::upscaler_caps().frames_presented);
++    }
++    if (!(hz > 0.0)) {
++        return 0u;
++    }
++    return static_cast<uint32_t>(hz * 10.0 + 0.5);
++#else
++    return 0;
++#endif
++}
++
+ uint32_t svc_option(void*, uint32_t what) {
+     switch (what) {
+     case NEBULA_OPTION_TEXT_SPEED:
+@@ -2407,6 +2426,14 @@ uint32_t svc_option(void*, uint32_t what) {
+ #else
+         return 0;
+ #endif
++    case NEBULA_OPTION_SHOW_FPS:
++#if defined(NEBULA_HOST_RENDERER)
++        return galaxy::render::get_render_config().show_fps ? 1u : 0u;
++#else
++        return 0;
++#endif
++    case NEBULA_OPTION_FPS:
++        return sampled_fps_tenths();
+     default:
+         return 0;
+     }
+diff --git a/native/include/nebula_game_api.h b/native/include/nebula_game_api.h
+index d997188..4542105 100644
+--- a/native/include/nebula_game_api.h
++++ b/native/include/nebula_game_api.h
+@@ -380,6 +380,9 @@ enum {
+                                         (the preparation screen shows) */
+     NEBULA_OPTION_PREPARE_PROGRESS,  /* while NEBULA_OPTION_PREPARATION is 2: its progress, 0 to 10000, never going back */
+     NEBULA_OPTION_DIAGNOSE_SCENE_LOADS, /* --diagnostics scene-loads: 1 logs what each scene change loads */
++    NEBULA_OPTION_SHOW_FPS,            /* 1 when DISPLAY > INTERFACE > FPS COUNTER is on: the game draws the readout */
++    NEBULA_OPTION_FPS,                 /* NEBULA_OPTION_SHOW_FPS's measure: frames presented a second, in tenths,
++                                          smoothed; 0 until it has a measure */
+     NEBULA_OPTION_TOUCH_POINTER,       /* 0 no touch screen, 1 one, 2 the finger has the pointer, 3 and the game is on a
+                                           menu: no pointer shows under a finger there */
+ };
 diff --git a/native/math/src/nebula_libc.c b/native/math/src/nebula_libc.c
 index cb8eab8..f1ff892 100644
 --- a/native/math/src/nebula_libc.c
@@ -46,6 +105,413 @@ index cb8eab8..f1ff892 100644
  typedef uint64_t __attribute__((may_alias, aligned(1))) Word;
  
  void* memcpy(void* pDst, const void* pSrc, size_t size) {
+diff --git a/native/petari/include/Game/Screen/GameSceneLayoutHolder.hpp b/native/petari/include/Game/Screen/GameSceneLayoutHolder.hpp
+index 9eaa755..57434d5 100644
+--- a/native/petari/include/Game/Screen/GameSceneLayoutHolder.hpp
++++ b/native/petari/include/Game/Screen/GameSceneLayoutHolder.hpp
+@@ -10,6 +10,7 @@ class MarioSubMeter;
+ class MissLayout;
+ class NebulaAchievementBoard;
+ class NebulaAchievementToast;
++class NebulaFpsCounter;
+ class NebulaModText;
+ class NoteCounter;
+ class OneUpBoard;
+@@ -57,6 +58,8 @@ public:
+     NebulaAchievementToast* mAchievementToast;
+     // Plugins' lines of text over the game (draw_text), drawn with the pop-up; null while no mod's code runs.
+     NebulaModText* mModText;
++    // The frames a second readout (DISPLAY > INTERFACE > FPS COUNTER), drawn last of all.
++    NebulaFpsCounter* mFpsCounter;
+     // Nebula's achievement board, in the Observatory (its Luma opens it); null elsewhere.
+     NebulaAchievementBoard* mAchievementBoard;
+ };
+diff --git a/native/petari/include/Game/Screen/NebulaFpsCounter.hpp b/native/petari/include/Game/Screen/NebulaFpsCounter.hpp
+new file mode 100644
+index 0000000..7b105d4
+--- /dev/null
++++ b/native/petari/include/Game/Screen/NebulaFpsCounter.hpp
+@@ -0,0 +1,41 @@
++#pragma once
++
++#include "Game/Screen/LayoutActor.hpp"
++
++class NebulaPaneKit;
++
++namespace Ui {
++    class Pane;
++    class TextBox;
++    class Window;
++}  // namespace Ui
++
++// The frames a second readout (DISPLAY > INTERFACE > FPS COUNTER): the presents the display got this second, smoothed,
++// in the game's message font on the information window, painted in the blues of Nebula's menus. Top left, above every
++// other 2D element. GameScene runs and draws it with NebulaModText; GameSceneLayoutHolder makes it.
++class NebulaFpsCounter : public LayoutActor {
++public:
++    NebulaFpsCounter();
++
++    virtual void init(const TableIter& rIter) override;
++
++    // GameScene: the host's measure, the window around it, and their drawing.
++    void update();
++    void drawOnTop() const;
++
++private:
++    void place();
++    // "120 FPS" for `tenths` (the host's measure, in tenths of a frame a second).
++    void setValue(u32 tenths);
++
++    NebulaPaneKit* mKitText;    // InformationWindow: the game's message font
++    NebulaPaneKit* mKitWindow;  // SysInfoWindowMini: the window with a ring
++    Ui::Pane* mGroup;
++    Ui::Window* mPanel;
++    Ui::TextBox* mValue;
++    f32 mScaleX;
++    f32 mWidth;
++    f32 mHeight;
++    u32 mShownTenths;
++    bool mReady;
++};
+diff --git a/native/petari/src/Game/Scene/GameScene.cpp b/native/petari/src/Game/Scene/GameScene.cpp
+index dc12aaf..c296d4c 100644
+--- a/native/petari/src/Game/Scene/GameScene.cpp
++++ b/native/petari/src/Game/Scene/GameScene.cpp
+@@ -82,6 +82,7 @@
+ #include "Game/NPC/NebulaAchievementLuma.hpp"
+ #include "Game/Screen/NebulaAchievementBoard.hpp"
+ #include "Game/Screen/NebulaAchievementToast.hpp"
++#include "Game/Screen/NebulaFpsCounter.hpp"
+ #include "Game/Screen/NebulaModText.hpp"
+ #include "Game/System/NebulaAchievements.hpp"
+ #include "Game/Util/MessageUtil.hpp"
+@@ -296,6 +297,9 @@ void GameScene::update() {
+     if (MR::isExistSceneObj(SceneObj_GameSceneLayoutHolder) && MR::getGameSceneLayoutHolder()->mAchievementToast != nullptr) {
+         MR::getGameSceneLayoutHolder()->mAchievementToast->update();
+     }
++    if (MR::isExistSceneObj(SceneObj_GameSceneLayoutHolder) && MR::getGameSceneLayoutHolder()->mFpsCounter != nullptr) {
++        MR::getGameSceneLayoutHolder()->mFpsCounter->update();
++    }
+     if (MR::isExistSceneObj(SceneObj_GameSceneLayoutHolder) && MR::getGameSceneLayoutHolder()->mModText != nullptr) {
+         MR::getGameSceneLayoutHolder()->mModText->update();
+     }
+@@ -601,6 +605,10 @@ void GameScene::drawOverlay() const {
+     if (MR::isExistSceneObj(SceneObj_GameSceneLayoutHolder) && MR::getGameSceneLayoutHolder()->mAchievementToast != nullptr) {
+         MR::getGameSceneLayoutHolder()->mAchievementToast->drawOnTop();
+     }
++    // Last of all: the readout over everything 2D.
++    if (MR::isExistSceneObj(SceneObj_GameSceneLayoutHolder) && MR::getGameSceneLayoutHolder()->mFpsCounter != nullptr) {
++        MR::getGameSceneLayoutHolder()->mFpsCounter->drawOnTop();
++    }
+ }
+ 
+ bool GameScene::isValidScenarioOpeningCamera() const {
+diff --git a/native/petari/src/Game/Screen/GameSceneLayoutHolder.cpp b/native/petari/src/Game/Screen/GameSceneLayoutHolder.cpp
+index 30039b3..c246b77 100644
+--- a/native/petari/src/Game/Screen/GameSceneLayoutHolder.cpp
++++ b/native/petari/src/Game/Screen/GameSceneLayoutHolder.cpp
+@@ -10,6 +10,7 @@
+ #include "Game/NPC/NebulaAchievementLuma.hpp"
+ #include "Game/Screen/NebulaAchievementBoard.hpp"
+ #include "Game/Screen/NebulaAchievementToast.hpp"
++#include "Game/Screen/NebulaFpsCounter.hpp"
+ #include "Game/Screen/NebulaModText.hpp"
+ #include "Game/Screen/NoteCounter.hpp"
+ #include "Game/Screen/OneUpBoard.hpp"
+@@ -22,7 +23,7 @@
+ GameSceneLayoutHolder::GameSceneLayoutHolder()
+     : NameObj("ゲームシーンのレイアウト保持"), mCameraInfo(nullptr), mInformationMessage(nullptr), mMarioMeter(nullptr), mMarioSubMeter(nullptr),
+       mMissLayout(nullptr), mNoteCounter(nullptr), mYesNoLayout(nullptr), mPurpleCoinCounter(nullptr), mIsStatusInvalidatePending(false),
+-      mCounterLayoutCtrl(nullptr), mIsActiveDefaultGameLayout(true), mAchievementToast(nullptr), mModText(nullptr), mAchievementBoard(nullptr) {
++      mCounterLayoutCtrl(nullptr), mIsActiveDefaultGameLayout(true), mAchievementToast(nullptr), mModText(nullptr), mFpsCounter(nullptr), mAchievementBoard(nullptr) {
+     MR::joinToNameObjGroup(this, "IgnorePauseNameObj");
+     MR::connectToSceneLayoutMovement(this);
+ 
+@@ -61,6 +62,8 @@ GameSceneLayoutHolder::GameSceneLayoutHolder()
+         mModText = new NebulaModText();
+         mModText->initWithoutIter();
+     }
++    mFpsCounter = new NebulaFpsCounter();
++    mFpsCounter->initWithoutIter();
+     mAchievementBoard = nullptr;
+     if (NebulaAchievementLuma::isHere()) {
+         mAchievementBoard = new NebulaAchievementBoard();
+diff --git a/native/petari/src/Game/Screen/NebulaFpsCounter.cpp b/native/petari/src/Game/Screen/NebulaFpsCounter.cpp
+new file mode 100644
+index 0000000..9b4d357
+--- /dev/null
++++ b/native/petari/src/Game/Screen/NebulaFpsCounter.cpp
+@@ -0,0 +1,149 @@
++#include "Game/Screen/NebulaFpsCounter.hpp"
++#include <nebula_module.h>
++
++#include "Game/Screen/LayoutManager.hpp"
++#include "Game/Screen/NebulaPaneKit.hpp"
++#include "Game/Screen/NebulaUi.hpp"
++#include "Game/System/NebulaHost.hpp"
++#include <Game/Ui/Layout.hpp>
++#include <Game/Ui/Pane.hpp>
++#include <Game/Ui/TextBox.hpp>
++#include <Game/Ui/Window.hpp>
++#include <cstring>
++
++namespace {
++    // In the screen's units (the canvas is 456 high at every resolution): the number's size, the window's padding, its
++    // distance from the screen's top left corner, its corner radius, and the width the measure may take before the
++    // writer breaks the line (it never does: the readout is one short line).
++    const f32 cSize = 14.0f;
++    const f32 cPaddingX = 9.0f;
++    const f32 cPaddingY = 5.0f;
++    const f32 cMargin = 12.0f;
++    const f32 cRadius = 8.0f;
++    const f32 cMeasureLimit = 160.0f;
++
++    // The menus' blues: the deep navy window, its sky rim, and the readout in near white with a cool foot.
++    const u32 cPanelFill = 0x0B1F3ACA;
++    const u32 cPanelRing = 0x63B8F0FF;
++    const u32 cTextTop = 0xFFFFFFFF;
++    const u32 cTextBottom = 0xD8E9FAFF;
++}  // namespace
++
++NebulaFpsCounter::NebulaFpsCounter()
++    : LayoutActor("NebulaFpsCounter", true), mKitText(nullptr), mKitWindow(nullptr), mGroup(nullptr), mPanel(nullptr),
++      mValue(nullptr), mScaleX(1.0f), mWidth(0.0f), mHeight(0.0f), mShownTenths(0xFFFFFFFFu), mReady(false) {
++}
++
++void NebulaFpsCounter::init(const TableIter& /*rIter*/) {
++    initLayoutManager("InformationWindow", 0);
++    LayoutManager* pManager = getLayoutManager();
++    static const char cLayoutName[] = "NebulaFpsCounter";
++    delete[] pManager->mLayoutName;
++    pManager->mLayoutName = new char[sizeof(cLayoutName)];
++    memcpy(pManager->mLayoutName, cLayoutName, sizeof(cLayoutName));
++
++    Ui::Pane* pRoot = pManager->mLayout->mpRootPane;
++    mKitText = new NebulaPaneKit();
++    mKitWindow = new NebulaPaneKit();
++    if (pRoot == nullptr || !mKitText->init(pManager->mLayoutHolder, "InformationWindow", pManager->mLayout)) {
++        nebula_log("NebulaFpsCounter: no InformationWindow layout\n");
++        return;
++    }
++    // The window is the game's ringed one; without it the message font's own information window stands in.
++    const bool ringed = mKitWindow->init("SysInfoWindowMini", pManager->mLayout);
++    // The information window's own panes stay hidden: only the readout shows.
++    for (Ui::Pane* pChild : pRoot->GetChildList()) {
++        pChild->SetVisible(false);
++    }
++    mGroup = NebulaUi::makeGroup(pRoot, "NbFpsGroup");
++    if (mGroup == nullptr) {
++        return;
++    }
++    const NebulaUi::Kits kits = {mKitText, ringed ? mKitWindow : mKitText, nullptr};
++    mPanel = NebulaUi::makeWindow(kits, mGroup, "NbFpsPanel");
++    if (mPanel != nullptr) {
++        NebulaUi::paint(mPanel, cPanelFill, cPanelRing);
++    }
++    mValue = NebulaUi::makeText(kits, mGroup, "NbFpsValue", 16);
++    if (mValue == nullptr) {
++        return;
++    }
++    NebulaUi::setTextStyle(mValue, cSize, cTextTop, cTextBottom, 4);
++    NebulaUi::setText(mValue, u"0 FPS");
++    mGroup->SetVisible(false);
++    mReady = true;
++    LayoutActor::appear();
++}
++
++// "120 FPS" from the host's measure, in tenths of a frame a second, rounded to the frame.
++void NebulaFpsCounter::setValue(u32 tenths) {
++    char16_t digits[12];
++    u32 count = 0;
++    u32 value = (tenths + 5u) / 10u;
++    do {
++        digits[count++] = static_cast< char16_t >(u'0' + value % 10u);
++        value /= 10u;
++    } while (value != 0u && count < sizeof(digits) / sizeof(digits[0]));
++
++    char16_t text[20];
++    u32 length = 0;
++    while (count > 0 && length < 12) {
++        text[length++] = digits[--count];
++    }
++    static const char16_t cSuffix[] = u" FPS";
++    for (u32 i = 0; cSuffix[i] != 0 && length < 19; i++) {
++        text[length++] = cSuffix[i];
++    }
++    text[length] = 0;
++    NebulaUi::setText(mValue, text);
++}
++
++// The window and its number, in screen units: pinned to the screen's top left corner at any aspect ratio.
++void NebulaFpsCounter::place() {
++    mGroup->mScale = Vec2f(mScaleX, 1.0f);
++    NebulaUi::setTextStyle(mValue, cSize, cTextTop, cTextBottom, 4);
++    f32 textWidth = 0.0f;
++    f32 textHeight = 0.0f;
++    NebulaUi::measure(mValue, cMeasureLimit, &textWidth, &textHeight);
++    const f32 panelWidth = textWidth + 2.0f * cPaddingX;
++    const f32 panelHeight = textHeight + 2.0f * cPaddingY;
++    const f32 x = -mWidth * 0.5f + cMargin + panelWidth * 0.5f;
++    const f32 y = mHeight * 0.5f - cMargin - panelHeight * 0.5f;
++    if (mPanel != nullptr) {
++        NebulaUi::shape(mPanel, x, y, panelWidth, panelHeight, cRadius);
++    }
++    NebulaUi::setAnchor(mValue, 4);
++    mValue->mTranslate = Vec3f(x, NebulaUi::textCentre(y, cSize), 0.0f);
++}
++
++void NebulaFpsCounter::update() {
++    if (!mReady) {
++        return;
++    }
++    const u32 tenths = NebulaHost::option(NEBULA_OPTION_FPS);
++    // No measure yet (the renderer's first second): the window waits rather than showing a zero it would have to take
++    // back.
++    const bool shown = NebulaHost::option(NEBULA_OPTION_SHOW_FPS) != 0u && tenths != 0u;
++    mGroup->SetVisible(shown);
++    if (!shown) {
++        return;
++    }
++    f32 scaleX, width, height;
++    NebulaUi::readScreen(&scaleX, &width, &height);
++    if (scaleX != mScaleX || width != mWidth || height != mHeight || tenths != mShownTenths) {
++        mScaleX = scaleX;
++        mWidth = width;
++        mHeight = height;
++        mShownTenths = tenths;
++        setValue(tenths);
++        place();
++    }
++    movement();
++    calcAnim();
++}
++
++void NebulaFpsCounter::drawOnTop() const {
++    if (mReady) {
++        draw();
++    }
++}
+diff --git a/native/petari/src/Game/Screen/NebulaSettingsMenu.cpp b/native/petari/src/Game/Screen/NebulaSettingsMenu.cpp
+index 411e3a5..90ade89 100644
+--- a/native/petari/src/Game/Screen/NebulaSettingsMenu.cpp
++++ b/native/petari/src/Game/Screen/NebulaSettingsMenu.cpp
+@@ -108,29 +108,38 @@ namespace {
+     NEBULA_TUNABLE(f32, cEdgeScrollRows, 8.0f);  // a list under a dragged mod at its edge scrolls this many rows a second at most
+     NEBULA_TUNABLE(s32, cRowChipsFirst, 48);   // the rows' buttons made with the screen; more when the rows in sight need them
+ 
+-    // The quit question's window and text; the game's blue for what is chosen.
+-    const u32 cText = 0x4A5274FF;
+-    NEBULA_TUNABLE(u32, cSubText, 0x737B9AFF);
+-    NEBULA_TUNABLE(u32, cAccent, 0x2F6FD0FF);
+-    const u32 cDisabled = NEBULA_RGBA(0x9A, 0xA2, 0xBC, 0xFF);
+-    const u32 cWarning = NEBULA_RGBA(0xC8, 0x40, 0x2E, 0xFF);
+-    NEBULA_TUNABLE(u32, cHighlightFill, 0xFFFFFFFF);
+-    NEBULA_TUNABLE(u32, cFrameFill, 0xFFFFFFB4);   // a row's frame
+-    NEBULA_TUNABLE(u32, cFrameFixed, 0xFFFFFF5A);  // a row that only shows something
+-    const u32 cFrameRing = NEBULA_RGBA(0xC6, 0xD3, 0xEB, 0xFF);
+-    NEBULA_TUNABLE(u32, cHighlightRing, 0x7EC8F4FF);
+-    NEBULA_TUNABLE(u32, cRule, 0xB4C2DEFF);
+-    NEBULA_TUNABLE(u32, cTrack, 0x4A527428);
+-    const u32 cSliderTrack = NEBULA_RGBA(0xCB, 0xD6, 0xEB, 0xFF);
+-    NEBULA_TUNABLE(u32, cSliderFill, 0x6FA6EAFF);
+-    NEBULA_TUNABLE(u32, cRowButtonFill, 0xE4F6FFFF);  // a row's own button: its face, its ring, the edge under it
+-    NEBULA_TUNABLE(u32, cRowButtonRing, 0x5CC4F0FF);
+-    NEBULA_TUNABLE(u32, cRowButtonLit, 0xFFFFFFFF);  // focused
+-    NEBULA_TUNABLE(u32, cRowButtonLitRing, 0x2F9AEEFF);
+-    NEBULA_TUNABLE(u32, cRowButtonEdge, 0x3E86C8FF);
+-    NEBULA_TUNABLE(u32, cRowButtonOff, 0xEEF1F6FF);  // unavailable
+-    NEBULA_TUNABLE(u32, cThumb, 0x7EA8E8FF);
+-    NEBULA_TUNABLE(u32, cButtonText, 0x505050FF);
++    // The menu's look: a deep navy window with a bright sky rim and gold for what is chosen, after the blue menus of
++    // New Super Mario Bros. Wii. Every colour here is a tunable (docs/TUNABLES.md), so a mod can repaint it whole.
++    const u32 cText = 0xFFFFFFFF;                       // a row's label, near white with a cool foot
++    const u32 cTextLow = NEBULA_RGBA(0xD8, 0xE9, 0xFA, 0xFF);
++    NEBULA_TUNABLE(u32, cSubText, 0xA6C4E6FF);          // the status line, the hints, the em dashes
++    NEBULA_TUNABLE(u32, cAccent, 0x8FD9FFFF);           // a section's heading and its rule
++    NEBULA_TUNABLE(u32, cAccentLow, 0x5FA8E8FF);
++    const u32 cDisabled = NEBULA_RGBA(0x8C, 0xA6, 0xC4, 0xFF);
++    const u32 cWarning = NEBULA_RGBA(0xFF, 0xB0, 0x5A, 0xFF);
++    NEBULA_TUNABLE(u32, cHighlightFill, 0x2C7FD6F0);    // the chosen row
++    NEBULA_TUNABLE(u32, cHighlightRing, 0xFFD24DFF);    // its gold rim
++    NEBULA_TUNABLE(u32, cFrameFill, 0x17385FB4);        // a row's frame
++    NEBULA_TUNABLE(u32, cFrameFixed, 0x102A4A8C);       // a row that only shows something
++    const u32 cFrameRing = NEBULA_RGBA(0x2C, 0x5A, 0x8F, 0xFF);
++    NEBULA_TUNABLE(u32, cPanelFill, 0x0B1F3AEC);        // the window itself: deep navy, a little see-through
++    NEBULA_TUNABLE(u32, cPanelRing, 0x63B8F0FF);        // its rim: the sky over the mushroom kingdom
++    NEBULA_TUNABLE(u32, cShadowFill, 0x020A16A0);       // under it
++    NEBULA_TUNABLE(u32, cRule, 0x6FB6E8B4);
++    NEBULA_TUNABLE(u32, cTrack, 0xFFFFFF28);
++    const u32 cSliderTrack = NEBULA_RGBA(0x0D, 0x24, 0x40, 0xFF);
++    NEBULA_TUNABLE(u32, cSliderFill, 0x59C8FFFF);
++    NEBULA_TUNABLE(u32, cRowButtonFill, 0xEAF4FFFF);    // a row's own button: its face, its ring, the edge under it
++    NEBULA_TUNABLE(u32, cRowButtonRing, 0x63B8F0FF);
++    NEBULA_TUNABLE(u32, cRowButtonLit, 0xFFFFFFFF);     // focused
++    NEBULA_TUNABLE(u32, cRowButtonLitRing, 0xFFD24DFF);
++    NEBULA_TUNABLE(u32, cRowButtonEdge, 0x143A66FF);
++    NEBULA_TUNABLE(u32, cRowButtonOff, 0x9FB4C8FF);     // unavailable
++    NEBULA_TUNABLE(u32, cThumb, 0x8FD9FFFF);
++    NEBULA_TUNABLE(u32, cButtonText, 0x123055FF);       // on the game's white button art
++    NEBULA_TUNABLE(u32, cTabText, 0x1B5E9EFF);          // a page's button, its chosen one deeper still
++    NEBULA_TUNABLE(u32, cTabTextOn, 0x0B2A55FF);
++    NEBULA_TUNABLE(u32, cArrowText, 0x0E4C8AFF);        // a setting's arrows, on their white faces
+ 
+     enum { FooterApply, FooterBack, FooterNum };
+     enum { ChoiceNum = 3 };
+@@ -1367,13 +1376,15 @@ bool NebulaSettingsScreen::build() {
+     }
+     mShadow->mBasePosition = 4;
+     mPanel->mBasePosition = 4;
++    paint(mShadow, cShadowFill, cShadowFill);
++    paint(mPanel, cPanelFill, cPanelRing);
+     mPage->AppendChild(mShadow);
+     mPage->AppendChild(mPanel);
+     mTitle = makeText(mKits, mPage, "NsTitle", 64);
+     if (mTitle == nullptr) {
+         return false;
+     }
+-    setTextStyle(mTitle, cTitleSize, cText, cText, 3);
++    setTextStyle(mTitle, cTitleSize, cText, cTextLow, 3);
+     while (mTabsMade < cTabsFirst) {
+         if (!addTab()) {
+             return false;
+@@ -1459,6 +1470,8 @@ bool NebulaSettingsScreen::build() {
+     mQuestionDim->mBasePosition = 4;
+     mQuestionShadow->mBasePosition = 4;
+     mQuestionPanel->mBasePosition = 4;
++    paint(mQuestionShadow, cShadowFill, cShadowFill);
++    paint(mQuestionPanel, cPanelFill, cPanelRing);
+     mQuestion->AppendChild(mQuestionDim);
+     mQuestion->AppendChild(mQuestionShadow);
+     mQuestion->AppendChild(mQuestionPanel);
+@@ -1642,7 +1655,8 @@ __attribute__((noinline)) void NebulaSettingsScreen::fillTexts(const NebulaSetti
+             }
+         }
+         setText(rRow.mLabel, text.c_str());
+-        setTextStyle(rRow.mLabel, heading ? cHeadingSize : cTextSize, heading ? cAccent : cText, heading ? cAccent : cText, 3);
++        setTextStyle(rRow.mLabel, heading ? cHeadingSize : cTextSize, heading ? cAccent : cText,
++                     heading ? cAccentLow : cTextLow, 3);
+         measure(rRow.mLabel, 4000.0f, &rRow.mLabelWidth, &height);
+         rRow.mRule->SetVisible(heading);
+         rRow.mFrame->SetVisible(!heading);
+@@ -2711,7 +2725,8 @@ RowChip& NebulaSettingsScreen::useRowChip(s32 index, s32 row, s32 button, u32 ve
+         rPooled.mVersion = version;
+         rChip.mFocusLevel = 0.0f;
+         const bool arrow = button == ChipLess || button == ChipMore;
+-        setTextStyle(rChip.mText, arrow ? cArrowSize : cRowButtonSize, arrow ? cAccent : cButtonText, arrow ? cAccent : cButtonText, 4);
++        setTextStyle(rChip.mText, arrow ? cArrowSize : cRowButtonSize, arrow ? cArrowText : cButtonText,
++                      arrow ? cArrowText : cButtonText, 4);
+         setText(rChip.mText, pWord);
+         rChip.mText->mRotate.z = button == ChipLess ? 90.0f : button == ChipMore ? -90.0f : 0.0f;
+         f32 height = 0.0f;
+@@ -2935,7 +2950,7 @@ void NebulaSettingsScreen::place(const NebulaSettingsView& rView) {
+         const f32 word = mTabWordWidths[i];
+         rTab.mText->mScale = Vec2f(word > room && word > 0.0f ? room / word : 1.0f, 1.0f);
+         rTab.mText->mTranslate = Vec3f(0.0f, textCentre(0.0f, cTabSize), 0.0f);
+-        setTextColor(rTab.mText, active ? cAccent : cButtonText, active ? cAccent : cButtonText);
++        setTextColor(rTab.mText, active ? cTabTextOn : cTabText, active ? cTabTextOn : cTabText);
+     }
+ 
+     const bool asking = mQuestionShown >= 0;
 diff --git a/platform/sdl/host_window_sdl.cpp b/platform/sdl/host_window_sdl.cpp
 index 3db51a7..dbe5673 100644
 --- a/platform/sdl/host_window_sdl.cpp
@@ -59,6 +525,21 @@ index 3db51a7..dbe5673 100644
      const std::lock_guard<std::mutex> lock(galaxy::sdl::g_input_mutex);
      galaxy::sdl::g_capture_result.reset();
      galaxy::sdl::g_capture_device = input::DeviceKey{scheme, slot};
+diff --git a/runtime/include/galaxy/render/render_config.h b/runtime/include/galaxy/render/render_config.h
+index f1386b9..e028180 100644
+--- a/runtime/include/galaxy/render/render_config.h
++++ b/runtime/include/galaxy/render/render_config.h
+@@ -77,6 +77,10 @@ struct RenderConfig {
+     // scale, then to the window) instead of one.
+     bool     hud_output_resolution = false;
+ 
++    // The frames-per-second readout over the game (DISPLAY > INTERFACE > FPS COUNTER), drawn by the game module in
++    // the game's own message font: the presents the display got this second, smoothed.
++    bool     show_fps            = false;
++
+     // Presentation image quality (post_process.h), applied to the presented frame on the render thread; false
+     // presents with the plain bilinear blit.
+     bool     post_process        = true;
 diff --git a/runtime/src/render/core/draw_walker.cpp b/runtime/src/render/core/draw_walker.cpp
 index 82ad286..944865a 100644
 --- a/runtime/src/render/core/draw_walker.cpp
@@ -85,3 +566,153 @@ index b9d9831..5cfe68f 100644
  #include "galaxy/render/render_config.h"
  #include "galaxy/render/renderer_common.h"
  #if !defined(NEBULA_GPU_VULKAN)
+diff --git a/runtime/src/render/render_config.cpp b/runtime/src/render/render_config.cpp
+index 7e8bf4d..6d0d2fd 100644
+--- a/runtime/src/render/render_config.cpp
++++ b/runtime/src/render/render_config.cpp
+@@ -155,6 +155,7 @@ static void apply_kv(RenderConfig& cfg, const char* key, const char* val) {
+     else if (std::strcmp(key, "post_process") == 0) cfg.post_process = parse_bool(val, cfg.post_process);
+     else if (std::strcmp(key, "internal_height") == 0) cfg.internal_height = normalized_internal_height(parse_uint(val, cfg.internal_height));
+     else if (std::strcmp(key, "hud_output_resolution") == 0) cfg.hud_output_resolution = parse_bool(val, cfg.hud_output_resolution);
++    else if (std::strcmp(key, "show_fps") == 0) cfg.show_fps = parse_bool(val, cfg.show_fps);
+     else if (std::strcmp(key, "hdr") == 0) cfg.hdr = parse_bool(val, cfg.hdr);
+     else if (std::strcmp(key, "paper_white") == 0) cfg.paper_white = std::clamp(parse_uint(val, cfg.paper_white), 80u, 500u);
+     else if (std::strcmp(key, "aa") == 0) {
+@@ -578,6 +579,7 @@ bool save_render_config_to_file() {
+              << "paper_white=" << cfg.paper_white << '\n'
+              << "hud_output_resolution="
+              << (cfg.hud_output_resolution ? 1u : 0u) << '\n'
++             << "show_fps=" << (cfg.show_fps ? 1u : 0u) << '\n'
+              << "ray_tracing_enabled="
+              << (cfg.ray_tracing_enabled ? 1u : 0u) << '\n'
+              << "texture_packs=" << (cfg.texture_packs ? 1u : 0u) << '\n'
+diff --git a/runtime/src/ui/native_settings.cpp b/runtime/src/ui/native_settings.cpp
+index c1581ba..eb54086 100644
+--- a/runtime/src/ui/native_settings.cpp
++++ b/runtime/src/ui/native_settings.cpp
+@@ -560,6 +560,7 @@ unsigned pending_settings_changes() {
+     changes += d.ambient_occlusion_ssao != live.ambient_occlusion_ssao;
+     changes += d.bloom != live.bloom;
+     changes += d.hud_output_resolution != live.hud_output_resolution;
++    changes += d.show_fps != live.show_fps;
+     changes += d.ray_tracing_enabled != live.ray_tracing_enabled;
+     changes += d.rt_quality != live.rt_quality;
+     changes += d.rt_reflections != live.rt_reflections;
+@@ -985,6 +986,7 @@ void apply_native_settings_draft() {
+     applied.ambient_occlusion_ssao = next.ambient_occlusion_ssao;
+     applied.bloom = next.bloom;
+     applied.hud_output_resolution = next.hud_output_resolution;
++    applied.show_fps = next.show_fps;
+     applied.ray_tracing_enabled = next.ray_tracing_enabled;
+     applied.rt_quality = next.rt_quality;
+     applied.rt_reflections = next.rt_reflections;
+@@ -1597,6 +1599,12 @@ void request_native_settings_close() {
+     set_native_settings_visible(false);
+ }
+ 
++// The key that opens and closes the settings overlay: F10, and F1 as it always was. Every other place in the menu that
++// took F1 (a question's back answer, the on-screen controls' cancel) takes either, so the two keys behave alike.
++constexpr bool is_settings_key(std::uintptr_t key) noexcept {
++    return key == VK_F1 || key == VK_F10;
++}
++
+ bool handle_native_settings_key(std::uintptr_t key, bool was_down, bool from_pad = false) {
+     if (s_home_menu.visible.load(std::memory_order_acquire)) {
+         return handle_home_menu_key(key, was_down);
+@@ -1605,7 +1613,7 @@ bool handle_native_settings_key(std::uintptr_t key, bool was_down, bool from_pad
+     // F1 and Escape close it; every other key waits.
+     if (s_native_settings_visible.load(std::memory_order_relaxed) &&
+         !s_settings_drawn_by_game.load(std::memory_order_acquire)) {
+-        if (!was_down && (key == VK_F1 || key == VK_ESCAPE)) {
++        if (!was_down && (is_settings_key(key) || key == VK_ESCAPE)) {
+             set_native_settings_visible(false);
+         }
+         return true;
+@@ -1634,7 +1642,7 @@ bool handle_native_settings_key(std::uintptr_t key, bool was_down, bool from_pad
+             } else if (key == VK_BACK) {
+                 galaxy::host::reset_arranged_touch_controls();
+                 std::cerr << "[settings] ON-SCREEN CONTROLS: RESET\n";
+-            } else if (key == VK_ESCAPE || key == VK_F1) {
++            } else if (key == VK_ESCAPE || is_settings_key(key)) {
+                 galaxy::host::finish_arranging_touch_controls(false);
+                 std::cerr << "[settings] ON-SCREEN CONTROLS: CANCEL\n";
+             }
+@@ -1644,7 +1652,7 @@ bool handle_native_settings_key(std::uintptr_t key, bool was_down, bool from_pad
+     if (s_joycon_pairing && s_native_settings_visible.load(std::memory_order_relaxed)) {
+         // The Pair Joy-Con screen: its one answer (Back) is Escape, B, A, Enter, Space, Backspace or F1; the rest
+         // waits (a paired Joy-Con's L and R must not turn the pages meanwhile).
+-        if (!was_down && (accept || key == VK_ESCAPE || key == VK_F1 || key == VK_RETURN || key == VK_SPACE ||
++        if (!was_down && (accept || key == VK_ESCAPE || is_settings_key(key) || key == VK_RETURN || key == VK_SPACE ||
+                           key == VK_BACK)) {
+             close_joycon_pairing();
+         }
+@@ -1670,16 +1678,16 @@ bool handle_native_settings_key(std::uintptr_t key, bool was_down, bool from_pad
+             s_settings_leave_asking = false;
+             revert_native_settings_draft();
+             set_native_settings_visible(false);
+-        } else if (key == VK_ESCAPE || key == VK_F1) {
++        } else if (key == VK_ESCAPE || is_settings_key(key)) {
+             s_settings_leave_asking = false;
+         }
+         return true;
+     }
+-    if (key != VK_F1 && s_native_settings_visible.load(std::memory_order_relaxed) &&
++    if (!is_settings_key(key) && s_native_settings_visible.load(std::memory_order_relaxed) &&
+         (dlss_prompt_key(key, was_down) || restart_ask_key(key, was_down))) {
+         return true;
+     }
+-    if (key != VK_F1 && s_native_settings_visible.load(std::memory_order_relaxed) &&
++    if (!is_settings_key(key) && s_native_settings_visible.load(std::memory_order_relaxed) &&
+         handle_controls_key(key, was_down, from_pad)) {
+         return true;
+     }
+@@ -1688,7 +1696,7 @@ bool handle_native_settings_key(std::uintptr_t key, bool was_down, bool from_pad
+         set_native_settings_visible(true);
+         return true;
+     }
+-    if (key == VK_F1) {
++    if (is_settings_key(key)) {
+         if (was_down) {
+             return true;
+         }
+@@ -3024,7 +3032,7 @@ bool restart_ask_key(std::uintptr_t key, bool was_down) {
+     if (s_mods_code_ask.load(std::memory_order_acquire)) {
+         if (key == VK_RETURN || key == VK_SPACE) {
+             answer_mod_code(true);
+-        } else if (key == VK_ESCAPE || key == VK_BACK || key == VK_F1) {
++        } else if (key == VK_ESCAPE || key == VK_BACK || is_settings_key(key)) {
+             answer_mod_code(false);
+         }
+         return true;
+@@ -3038,7 +3046,7 @@ bool restart_ask_key(std::uintptr_t key, bool was_down) {
+         } else {
+             show_controls_message("COULD NOT RESTART");
+         }
+-    } else if (key == VK_ESCAPE || key == VK_BACK || key == VK_F1) {
++    } else if (key == VK_ESCAPE || key == VK_BACK || is_settings_key(key)) {
+         s_mods_restart_ask.store(false, std::memory_order_release);
+         s_rt_restart_ask.store(false, std::memory_order_release);
+         s_diagnostics_ask.store(false, std::memory_order_release);
+@@ -3248,7 +3256,7 @@ void native_settings_test_frame(std::uint32_t frame) {
+         if (text == nullptr || text[0] == '\0') return keys;
+         static constexpr std::pair<std::string_view, std::uintptr_t> kNames[] = {
+             {"up", VK_UP}, {"down", VK_DOWN}, {"left", VK_LEFT}, {"right", VK_RIGHT}, {"enter", VK_RETURN},
+-            {"esc", VK_ESCAPE}, {"tab", VK_TAB}, {"backspace", VK_BACK}, {"space", VK_SPACE}, {"f1", VK_F1}};
++            {"esc", VK_ESCAPE}, {"tab", VK_TAB}, {"backspace", VK_BACK}, {"space", VK_SPACE}, {"f1", VK_F1}, {"f10", VK_F10}};
+         std::string_view rest(text);
+         while (!rest.empty()) {
+             const std::size_t comma = rest.find(',');
+diff --git a/runtime/src/ui/settings_display_page.cpp b/runtime/src/ui/settings_display_page.cpp
+index caf02a7..86be189 100644
+--- a/runtime/src/ui/settings_display_page.cpp
++++ b/runtime/src/ui/settings_display_page.cpp
+@@ -121,6 +121,9 @@ std::vector<SettingsRow> display_page(const RenderConfig& render, const DisplayP
+                     fixed ? std::function<void(RenderConfig&, int)>{}
+                           : std::function<void(RenderConfig&, int)>{[](RenderConfig& draft, int) { draft.hud_output_resolution = !draft.hud_output_resolution; }},
+                     "DISPLAY DRAWS MENUS AND TEXT SHARP AT THE SCREEN RESOLUTION"});
++    rows.push_back({"FPS COUNTER", render.show_fps ? "ON" : "OFF",
++                    [](RenderConfig& draft, int) { draft.show_fps = !draft.show_fps; },
++                    "FRAMES PER SECOND IN THE GAME'S OWN FONT, TOP LEFT"});
+     return rows;
+ }
+ 

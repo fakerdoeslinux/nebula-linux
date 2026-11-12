@@ -1,7 +1,8 @@
 # Super Mario Galaxy — native Linux port (Nebula)
 
 A ready-to-run Linux build of [Nebula](https://github.com/keepvaibin/nebula), the decompilation of *Super Mario
-Galaxy*, plus the five source changes, build scripts and desktop entry this port needs.
+Galaxy*, plus the source changes this port needs — the Linux port itself, an F10 options menu, the menu's deep-blue
+art and an FPS counter — with build scripts and a desktop entry.
 
 No Wine. No emulator. The game's code is compiled to a native Linux binary and runs on SDL3 + Vulkan.
 
@@ -20,7 +21,7 @@ $ ./scripts/build-linux.sh ~/Games/Super\ Mario\ Galaxy.rvz
 | `scripts/run-nebula.sh` | launcher (sets up the shader cache, finds the module and content) |
 | `scripts/set-video.sh` | resolution, aspect, upscaler and frame cap, written to `config.ini` |
 | `scripts/install-app.sh` | application-menu entry, icon, desktop shortcut, Plasma task-bar pin |
-| `patches/0001-linux-port.patch` | the five source changes upstream needs on Linux |
+| `patches/0001-linux-port.patch` | the source changes: the Linux port, the F10 menu, the menu art and the FPS counter |
 | `tools/CMakeLists.txt` | builds `galaxy_native_spirv` / `galaxy_utility_spirv` (upstream builds these on Windows only) |
 | `assets/nebula-smg.svg` | the app icon |
 
@@ -49,6 +50,31 @@ Launch it from the menu, the desktop shortcut, or:
 ```bash
 bash scripts/run-nebula.sh
 ```
+
+### In-game options — F10
+
+**F10** opens the options menu in game; **F1** still works. The pages are DISPLAY, GRAPHICS, CONTROLS, AUDIO, GENERAL,
+MODS and SYSTEM.
+
+- **AUDIO** — master, music, SFX, voice, ambience, cutscene and Wii Remote speaker volumes, 0-200% in 5% steps, plus
+  stereo/mono/surround and a defaults button. Apply writes them to `~/Documents/nebula-game/data/runtime_settings.ini`.
+- **DISPLAY** — display mode, refresh rate, aspect ratio, VSYNC, HDR, HUD resolution, FPS counter.
+- **GRAPHICS** — frame-rate limit and interpolation, upscaler (FSR 1, FSR 3, XeSS, DLSS), anti-aliasing, the render
+  resolution slider, bloom, and the renderer's other knobs.
+- **CONTROLS** — keyboard and pad bindings per player, with button places and a reset.
+
+Keys: up/down move the cursor, left/right change the value, **Tab** turns the page, Enter or Space takes, Esc leaves.
+A pad does the same: D-pad or stick, A takes, B backs out. The menu opens once a file is loaded — before that the game
+keeps it closed, and Esc or F10 puts it away.
+
+The window is drawn in the blues of *New Super Mario Bros. Wii*'s menus — navy fill, sky-blue rim, gold for the row
+under the cursor — inside the game's own layout system, so it keeps its shape at any aspect ratio.
+
+The FPS counter (DISPLAY ▸ INTERFACE ▸ FPS COUNTER) is drawn in Super Mario Galaxy's own message font on the game's
+information window, pinned to the screen's top left, above every other 2D element. The number is the renderer's
+measured present rate over its last second — the same figure as the menu's FRAME RATE row and
+`--diagnostics present-stats` — so `--fps 120` reads `120 FPS` and `--fps 60` reads `60 FPS`. It shows up once the
+first second has been measured, and the row turns it off from the menu or from `show_fps=0` in `config.ini`.
 
 ### Ultrawide — 2560x1080, 21:9, 32:9
 
@@ -183,6 +209,8 @@ Everything SDL3 recognises works: Xbox (wired or Bluetooth), DualSense/DualShock
 | Ultrawide picture is stretched or pillarboxed | `./scripts/set-video.sh --aspect auto --res 2560x1080`, then check `aspect=` and `window_width=` in `~/Documents/nebula-game/data/config.ini` |
 | Back buffer is smaller than the panel | a borderless window is capped to the work area; set the desktop panel to *Windows can cover* or auto-hide |
 | Saves | `~/Documents/nebula-game/saves`; logs in `.../data/logs/latest.log` |
+| F10 opens nothing at the title or file select | the game closes the menu until a file is loaded; open it in game |
+| FPS counter says `0 FPS` | it has no measure for its first second; the number lands on the next |
 | Rebuild after a source change | `bash scripts/build-linux.sh` again — every step is incremental |
 
 ## Windows
