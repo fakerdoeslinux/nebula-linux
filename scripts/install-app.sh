@@ -82,6 +82,17 @@ print('pinned=' + changed);
 " >/dev/null 2>&1 || true
 fi
 
+# The menu's six sounds (assets/menu-sounds): the game plays them for row focus, select, page, open, close and OK. They
+# live in the data folder, which the launcher passes as --data; without them the game falls back to its own system sounds.
+SOUNDS="$NEBULA_HOME/data/menu-sounds"
+if compgen -G "$REPO/assets/menu-sounds/*.wav" >/dev/null; then
+  mkdir -p "$SOUNDS"
+  for sound in "$REPO"/assets/menu-sounds/*.wav; do
+    install -m644 "$sound" "$SOUNDS/$(basename "$sound")"
+  done
+  echo "sounds:    $SOUNDS ($(ls -1 "$SOUNDS" | wc -l) files)"
+fi
+
 echo "installed: $ENTRY"
 echo "icon:      $ICONS/scalable/apps/$ICON_ID.svg"
 echo "launch:    bash $REPO/scripts/run-nebula.sh"

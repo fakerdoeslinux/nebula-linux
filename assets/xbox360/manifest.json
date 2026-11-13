@@ -1,0 +1,71 @@
+{
+  "name": "Super Mario Galaxy - Nebula Edition (Xbox 360)",
+  "title_id": "4E4E4542",
+  "media_id": "4E4542554C41",
+  "generated_by": "tools/xbox360/art.py",
+  "files": {
+    "boxart.png": {
+      "size": [
+        584,
+        700
+      ],
+      "note": "584x700, the cover"
+    },
+    "background.png": {
+      "size": [
+        1280,
+        720
+      ],
+      "note": "1280x720, the dashboard background"
+    },
+    "tile.png": {
+      "size": [
+        219,
+        300
+      ],
+      "note": "219x300, the list tile"
+    },
+    "banner.png": {
+      "size": [
+        1000,
+        250
+      ],
+      "note": "1000x250, a wide header"
+    },
+    "icon.png": {
+      "size": [
+        100,
+        100
+      ],
+      "note": "100x100, the title icon"
+    },
+    "icon-64.png": {
+      "size": [
+        64,
+        64
+      ],
+      "note": "64x64, the dashboard's icon slot"
+    },
+    "splash.png": {
+      "size": [
+        1280,
+        720
+      ],
+      "note": "1280x720, the title screen"
+    },
+    "disc.png": {
+      "size": [
+        1418,
+        1418
+      ],
+      "note": "1418x1418, a 12 cm disc label at 300 dpi"
+    },
+    "wordmark.png": {
+      "size": [
+        900,
+        292
+      ],
+      "note": "the title lockup, transparent"
+    }
+  }
+}

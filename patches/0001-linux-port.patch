@@ -1,3 +1,15 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 519f8e8..60794fe 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -179,6 +179,7 @@ add_library(galaxy_native_host STATIC
+     runtime/src/input/raw_mouse_win32.cpp
+     runtime/src/input/rumble_route.cpp
+     runtime/src/native_audio.cpp
++    runtime/src/ui_sounds.cpp
+     runtime/src/audio_device_wasapi.cpp
+     runtime/src/mii_import.cpp
+     runtime/src/mii_formats.cpp
 diff --git a/cmake/archive_deps.cmake b/cmake/archive_deps.cmake
 index bc15be8..940541f 100644
 --- a/cmake/archive_deps.cmake
@@ -24,10 +36,20 @@ index bc15be8..940541f 100644
          RESULT_VARIABLE result OUTPUT_QUIET ERROR_VARIABLE errors)
      if(NOT result EQUAL 0)
 diff --git a/native/host/host_main.cpp b/native/host/host_main.cpp
-index 41f607e..7471dfe 100644
+index 41f607e..ccb3bfe 100644
 --- a/native/host/host_main.cpp
 +++ b/native/host/host_main.cpp
-@@ -2309,6 +2309,25 @@ bool gPipelinesPrepared = false;
+@@ -105,6 +105,9 @@ inline bool perf_hint_on_battery() noexcept { return false; }
+ 
+ #include <SDL3/SDL_main.h>
+ #endif
++#if defined(NEBULA_XBOX360)
++#include "../../platform/xbox360/xbox360_platform.h"
++#endif
+ 
+ #include <algorithm>
+ #include <array>
+@@ -2309,6 +2312,25 @@ bool gPipelinesPrepared = false;
  #endif
  fs::path gModsProgressFile;
  
@@ -53,7 +75,7 @@ index 41f607e..7471dfe 100644
  uint32_t svc_option(void*, uint32_t what) {
      switch (what) {
      case NEBULA_OPTION_TEXT_SPEED:
-@@ -2407,6 +2426,14 @@ uint32_t svc_option(void*, uint32_t what) {
+@@ -2407,6 +2429,14 @@ uint32_t svc_option(void*, uint32_t what) {
  #else
          return 0;
  #endif
@@ -68,10 +90,64 @@ index 41f607e..7471dfe 100644
      default:
          return 0;
      }
+@@ -2893,6 +2923,21 @@ void svc_audio_frame(void*) {
+ #endif
+ }
+ 
++// The settings menu's sounds (ui_sounds.h): the player's own files, played by the host's mixer. Without a renderer there
++// is no device to mix them into, so the game makes its own.
++int svc_ui_sound(void*, uint32_t sound) {
++#if defined(NEBULA_HOST_RENDERER)
++    if (::galaxy::diagnosing(::galaxy::kDiagnoseFileReads)) {
++        std::fprintf(stderr, "[read] menu sound %u at sound frame %llu\n", sound,
++                     static_cast<unsigned long long>(gSoundBlocks.load(std::memory_order_relaxed)));
++    }
++    return gAudio != nullptr && gAudio->ui_sound(sound) ? 1 : 0;
++#else
++    (void)sound;
++    return 0;
++#endif
++}
++
+ // The movie's sound: headless, every frame is taken and dropped.
+ int svc_movie_audio(void*, const void* record, uint32_t size) {
+ #if defined(NEBULA_HOST_RENDERER)
+@@ -3593,6 +3638,14 @@ int main(int argc, char** argv) {
+         return 1;
+     }
+ #endif
++#if defined(NEBULA_XBOX360)
++    // The console (platform/xbox360): the scaler's 1280x720 mode, the memory the frame may still take, and the run's log
++    // on the hard disk. A title that cannot read a video mode has no display to present into.
++    if (!galaxy::host::x360::start()) {
++        return 1;
++    }
++    galaxy::host::x360::open_log("Hdd:\\Nebula\\nebula.log");
++#endif
+ #if defined(NEBULA_HOST_RENDERER) && defined(_WIN32)
+     // A player's start has nowhere to print (a launcher with no terminal, or none): the log goes to logs/latest.log beside the
+     // settings, the last start's to previous.log. A test or a shell capturing the output to a pipe or a file keeps it.
+@@ -3858,6 +3911,7 @@ int main(int argc, char** argv) {
+     services.display_extent = svc_display_extent;
+     services.option = svc_option;
+     services.game_stage = svc_game_stage;
++    services.ui_sound = svc_ui_sound;
+ #if defined(NEBULA_HOST_RENDERER)
+     // The display configuration (in --settings' folder when given), loaded before the window; the settings overlay
+     // reads its frame art from the game files.
 diff --git a/native/include/nebula_game_api.h b/native/include/nebula_game_api.h
-index d997188..4542105 100644
+index d997188..518cce0 100644
 --- a/native/include/nebula_game_api.h
 +++ b/native/include/nebula_game_api.h
+@@ -24,7 +24,7 @@ extern "C" {
+ #define NEBULA_GAME_API __attribute__((visibility("default")))
+ #endif
+ 
+-#define NEBULA_GAME_API_VERSION 150u
++#define NEBULA_GAME_API_VERSION 151u
+ 
+ /* The game's fixed step: nebula_game_run's loop runs this many steps a second (frame_wait paces them), whatever the
+    display's rate; the host presents each or interpolates between them. */
 @@ -380,6 +380,9 @@ enum {
                                          (the preparation screen shows) */
      NEBULA_OPTION_PREPARE_PROGRESS,  /* while NEBULA_OPTION_PREPARATION is 2: its progress, 0 to 10000, never going back */
@@ -82,6 +158,30 @@ index d997188..4542105 100644
      NEBULA_OPTION_TOUCH_POINTER,       /* 0 no touch screen, 1 one, 2 the finger has the pointer, 3 and the game is on a
                                            menu: no pointer shows under a finger there */
  };
+@@ -888,8 +891,23 @@ typedef struct NebulaHostServices {
+        per loss, then 0. The game asks only while it could open its pause menu, and opens it as the pause button does. A
+        request the game did not take (a cutscene, a wipe) lapses when the window is in front again. */
+     int (*take_pause_request)(void* user);
++    /* A sound of the host's settings menu, from the player's own files beside the game's data (`data/menu-sounds`, one
++       WAV per NEBULA_UI_SOUND_* name): 1 when it plays (the file is there), 0 when the player has none, and the game
++       makes its own. Any thread, and before the audio clock starts. */
++    int (*ui_sound)(void* user, uint32_t sound);
+ } NebulaHostServices;
+ 
++/* The sounds of the settings menu (ui_sound), named after their files in `data/menu-sounds`. */
++enum {
++    NEBULA_UI_SOUND_FOCUS = 0,  /* focus.wav: the highlight arrives at something */
++    NEBULA_UI_SOUND_SELECT,     /* select.wav: a value changes, a mod is dropped */
++    NEBULA_UI_SOUND_PAGE,       /* page.wav: another page */
++    NEBULA_UI_SOUND_OPEN,       /* open.wav: the menu opens */
++    NEBULA_UI_SOUND_CLOSE,      /* close.wav: the menu closes */
++    NEBULA_UI_SOUND_OK,         /* ok.wav: a change is applied */
++    NEBULA_UI_SOUND_NUM,
++};
++
+ 
+ enum {
+     NEBULA_MOVIE_NONE = -1,
 diff --git a/native/math/src/nebula_libc.c b/native/math/src/nebula_libc.c
 index cb8eab8..f1ff892 100644
 --- a/native/math/src/nebula_libc.c
@@ -173,6 +273,22 @@ index 0000000..7b105d4
 +    u32 mShownTenths;
 +    bool mReady;
 +};
+diff --git a/native/petari/include/Game/System/NebulaHost.hpp b/native/petari/include/Game/System/NebulaHost.hpp
+index 0e62e92..0c078e9 100644
+--- a/native/petari/include/Game/System/NebulaHost.hpp
++++ b/native/petari/include/Game/System/NebulaHost.hpp
+@@ -107,4 +107,11 @@ namespace NebulaHost {
+     inline int takePauseRequest() {
+         return nebula_host()->take_pause_request(nebula_host()->user);
+     }
++
++    // A sound of the settings menu, from the player's own files beside the game's data (data/menu-sounds, one WAV per
++    // NEBULA_UI_SOUND_* name): 1 when the host played it, 0 when the player has none, and the game makes its own.
++    inline int uiSound(u32 sound) {
++        const NebulaHostServices* const host = nebula_host();
++        return host->ui_sound != nullptr ? host->ui_sound(host->user, sound) : 0;
++    }
+ }  // namespace NebulaHost
 diff --git a/native/petari/src/Game/Scene/GameScene.cpp b/native/petari/src/Game/Scene/GameScene.cpp
 index dc12aaf..c296d4c 100644
 --- a/native/petari/src/Game/Scene/GameScene.cpp
@@ -392,10 +508,26 @@ index 0000000..9b4d357
 +    }
 +}
 diff --git a/native/petari/src/Game/Screen/NebulaSettingsMenu.cpp b/native/petari/src/Game/Screen/NebulaSettingsMenu.cpp
-index 411e3a5..90ade89 100644
+index 411e3a5..b51f5d5 100644
 --- a/native/petari/src/Game/Screen/NebulaSettingsMenu.cpp
 +++ b/native/petari/src/Game/Screen/NebulaSettingsMenu.cpp
-@@ -108,29 +108,38 @@ namespace {
+@@ -35,6 +35,15 @@
+ using namespace NebulaUi;
+ 
+ namespace {
++    // A sound of the menu: the player's own from beside the game's data (data/menu-sounds, nebula_game_api.h
++    // NEBULA_UI_SOUND_*), else the game's own effect. The host's player is used because the game's own streams are
++    // faded out while the menu is open (AudSystem::holdForSettingsMenu).
++    void menuSound(u32 sound, const char* pFallback) {
++        if (NebulaHost::uiSound(sound) == 0) {
++            MR::startSystemSE(pFallback);
++        }
++    }
++
+     // Screen units (NebulaUi::readScreen): 456 high, 810 wide at 16:9.
+     NEBULA_TUNABLE(f32, cMargin, 16.0f);     // the window from the screen's edges
+     NEBULA_TUNABLE(f32, cMaxWidth, 900.0f);  // a wide screen keeps a window that reads as one
+@@ -108,29 +117,38 @@ namespace {
      NEBULA_TUNABLE(f32, cEdgeScrollRows, 8.0f);  // a list under a dragged mod at its edge scrolls this many rows a second at most
      NEBULA_TUNABLE(s32, cRowChipsFirst, 48);   // the rows' buttons made with the screen; more when the rows in sight need them
  
@@ -457,7 +589,7 @@ index 411e3a5..90ade89 100644
  
      enum { FooterApply, FooterBack, FooterNum };
      enum { ChoiceNum = 3 };
-@@ -1367,13 +1376,15 @@ bool NebulaSettingsScreen::build() {
+@@ -1367,13 +1385,15 @@ bool NebulaSettingsScreen::build() {
      }
      mShadow->mBasePosition = 4;
      mPanel->mBasePosition = 4;
@@ -474,7 +606,7 @@ index 411e3a5..90ade89 100644
      while (mTabsMade < cTabsFirst) {
          if (!addTab()) {
              return false;
-@@ -1459,6 +1470,8 @@ bool NebulaSettingsScreen::build() {
+@@ -1459,6 +1479,8 @@ bool NebulaSettingsScreen::build() {
      mQuestionDim->mBasePosition = 4;
      mQuestionShadow->mBasePosition = 4;
      mQuestionPanel->mBasePosition = 4;
@@ -483,7 +615,7 @@ index 411e3a5..90ade89 100644
      mQuestion->AppendChild(mQuestionDim);
      mQuestion->AppendChild(mQuestionShadow);
      mQuestion->AppendChild(mQuestionPanel);
-@@ -1642,7 +1655,8 @@ __attribute__((noinline)) void NebulaSettingsScreen::fillTexts(const NebulaSetti
+@@ -1642,7 +1664,8 @@ __attribute__((noinline)) void NebulaSettingsScreen::fillTexts(const NebulaSetti
              }
          }
          setText(rRow.mLabel, text.c_str());
@@ -493,7 +625,34 @@ index 411e3a5..90ade89 100644
          measure(rRow.mLabel, 4000.0f, &rRow.mLabelWidth, &height);
          rRow.mRule->SetVisible(heading);
          rRow.mFrame->SetVisible(!heading);
-@@ -2711,7 +2725,8 @@ RowChip& NebulaSettingsScreen::useRowChip(s32 index, s32 row, s32 button, u32 ve
+@@ -1804,7 +1827,7 @@ __attribute__((noinline)) void NebulaSettingsScreen::fillTexts(const NebulaSetti
+         mQuestionShown = question;
+         setQuestion(question);
+         if (question >= 0) {
+-            MR::startSystemSE("SE_SY_TALK_FOCUS_ITEM");
++            menuSound(NEBULA_UI_SOUND_FOCUS, "SE_SY_TALK_FOCUS_ITEM");
+         }
+     }
+     if (question < 0) {
+@@ -2278,7 +2301,7 @@ void NebulaSettingsScreen::readModsPointer(const NebulaSettingsView& rView, f32
+         if (!mDragging && moved) {
+             mDragging = true;
+             mEdgeScrollNs = 0u;
+-            MR::startSystemSE("SE_SY_TALK_FOCUS_ITEM");
++            menuSound(NEBULA_UI_SOUND_FOCUS, "SE_SY_TALK_FOCUS_ITEM");
+         }
+         mDropList = mDragging ? overList : -1;
+         if (mDropList >= 0) {
+@@ -2300,7 +2323,7 @@ void NebulaSettingsScreen::readModsPointer(const NebulaSettingsView& rView, f32
+                 if (mDropList != mItemList[index] || place != mItemPlace[index]) {
+                     NebulaHost::settingsInput(NEBULA_SETTINGS_SELECT_ROW, mDragRow);
+                     NebulaHost::settingsInput(NEBULA_SETTINGS_MOVE_MOD, (mDropList + 1) << 16 | place);
+-                    MR::startSystemSE("SE_SY_SELECT_PAUSE_ITEM");
++                    menuSound(NEBULA_UI_SOUND_SELECT, "SE_SY_SELECT_PAUSE_ITEM");
+                     const char* pLabel = rView.rows[index].label;
+                     u32 length = 0;
+                     while (pLabel[length] != '\0') {
+@@ -2711,7 +2734,8 @@ RowChip& NebulaSettingsScreen::useRowChip(s32 index, s32 row, s32 button, u32 ve
          rPooled.mVersion = version;
          rChip.mFocusLevel = 0.0f;
          const bool arrow = button == ChipLess || button == ChipMore;
@@ -503,7 +662,7 @@ index 411e3a5..90ade89 100644
          setText(rChip.mText, pWord);
          rChip.mText->mRotate.z = button == ChipLess ? 90.0f : button == ChipMore ? -90.0f : 0.0f;
          f32 height = 0.0f;
-@@ -2935,7 +2950,7 @@ void NebulaSettingsScreen::place(const NebulaSettingsView& rView) {
+@@ -2935,7 +2959,7 @@ void NebulaSettingsScreen::place(const NebulaSettingsView& rView) {
          const f32 word = mTabWordWidths[i];
          rTab.mText->mScale = Vec2f(word > room && word > 0.0f ? room / word : 1.0f, 1.0f);
          rTab.mText->mTranslate = Vec3f(0.0f, textCentre(0.0f, cTabSize), 0.0f);
@@ -512,6 +671,75 @@ index 411e3a5..90ade89 100644
      }
  
      const bool asking = mQuestionShown >= 0;
+@@ -3042,7 +3066,7 @@ void NebulaSettingsScreen::placeJoyCon(f32 top) {
+     const bool paired = (bits & NEBULA_JOYCON_PAIRED) != 0;
+     const bool both = (bits & (NEBULA_JOYCON_LEFT | NEBULA_JOYCON_RIGHT)) == (NEBULA_JOYCON_LEFT | NEBULA_JOYCON_RIGHT);
+     if (paired && !mJoyConPaired) {
+-        MR::startSystemSE("SE_SY_TALK_OK");
++        menuSound(NEBULA_UI_SOUND_OK, "SE_SY_TALK_OK");
+     }
+     mJoyConPaired = paired;
+     const f32 phase = static_cast< f32 >(mFrame % 72) / 72.0f;
+@@ -3188,12 +3212,12 @@ void NebulaSettingsScreen::step(const NebulaSettingsView& rView, s32 homeView) {
+         }
+         mClosing = false;
+         if (!home) {
+-            MR::startSystemSE("SE_SY_PAUSE_ON");
++            menuSound(NEBULA_UI_SOUND_OPEN, "SE_SY_PAUSE_ON");
+         }
+     } else if (!wanted && isShown() && !mClosing) {
+         mClosing = true;
+         if (!mHome) {
+-            MR::startSystemSE("SE_SY_PAUSE_OFF");
++            menuSound(NEBULA_UI_SOUND_CLOSE, "SE_SY_PAUSE_OFF");
+         }
+     }
+     if (mClosing) {
+@@ -3239,7 +3263,7 @@ void NebulaSettingsScreen::step(const NebulaSettingsView& rView, s32 homeView) {
+     } else if (view.open && (view.open != mShown.open || view.revision != mShown.revision)) {
+         // What changed, as the game's menus sound it.
+         if (rView.page != mShown.page) {
+-            MR::startSystemSE("SE_SY_GALAMAP_PAGE_CHANGE");
++            menuSound(NEBULA_UI_SOUND_PAGE, "SE_SY_GALAMAP_PAGE_CHANGE");
+             mScrollTarget = 0.0f;
+             mFrame = 1;  // the new page's rows and highlight start in place
+             // What the pointer held belongs to the old page.
+@@ -3251,19 +3275,20 @@ void NebulaSettingsScreen::step(const NebulaSettingsView& rView, s32 homeView) {
+             mDragRow = -1;
+             mDragging = false;
+         } else if (rView.selected != mShown.selected) {
+-            // Moving through the rows is silent; a change or a press sounds.
++            // The highlight arriving at another row ticks, as the console's menus do; a value changed sounds instead.
+             if (static_cast< s32 >(rView.selected) != mPointerRow) {
+                 mPointerMode = false;  // the keys or a controller moved it: the pointer waits until it moves
++                menuSound(NEBULA_UI_SOUND_FOCUS, "SE_SY_TALK_FOCUS_ITEM");
+             }
+         } else {
+             const NebulaSettingsRow* pNow = rowAt(rView, rView.selected);
+             const NebulaSettingsRow* pBefore = rowAt(mShown, rView.selected);
+             if (pNow != nullptr && pBefore != nullptr && !MR::isEqualString(pNow->value, pBefore->value)) {
+-                MR::startSystemSE("SE_SY_SELECT_PAUSE_ITEM");
++                menuSound(NEBULA_UI_SOUND_SELECT, "SE_SY_SELECT_PAUSE_ITEM");
+             }
+         }
+         if (rView.status == NEBULA_SETTINGS_STATUS_APPLIED && mShown.status != NEBULA_SETTINGS_STATUS_APPLIED) {
+-            MR::startSystemSE("SE_SY_TALK_OK");
++            menuSound(NEBULA_UI_SOUND_OK, "SE_SY_TALK_OK");
+         }
+         fillTexts(view, &mShown);
+         if (!mBuilt) {
+diff --git a/platform/sdl/CMakeLists.txt b/platform/sdl/CMakeLists.txt
+index eab4aa0..1c98be0 100644
+--- a/platform/sdl/CMakeLists.txt
++++ b/platform/sdl/CMakeLists.txt
+@@ -151,6 +151,7 @@ add_library(galaxy_render_vk STATIC
+     ${rt}/tilt.cpp
+     ${rt}/audio_mixer.cpp
+     ${rt}/native_audio.cpp
++    ${rt}/ui_sounds.cpp
+     ${rt}/movie_audio.cpp
+     ${rt}/atomic_file.cpp
+     ${rt}/asset_store.cpp
 diff --git a/platform/sdl/host_window_sdl.cpp b/platform/sdl/host_window_sdl.cpp
 index 3db51a7..dbe5673 100644
 --- a/platform/sdl/host_window_sdl.cpp
@@ -525,6 +753,1688 @@ index 3db51a7..dbe5673 100644
      const std::lock_guard<std::mutex> lock(galaxy::sdl::g_input_mutex);
      galaxy::sdl::g_capture_result.reset();
      galaxy::sdl::g_capture_device = input::DeviceKey{scheme, slot};
+diff --git a/platform/xbox360/CMakeLists.txt b/platform/xbox360/CMakeLists.txt
+new file mode 100644
+index 0000000..4f4eeca
+--- /dev/null
++++ b/platform/xbox360/CMakeLists.txt
+@@ -0,0 +1,105 @@
++# The Xbox 360 build (docs/XBOX360.md): the console's platform layer, the Xenos device, XAudio2, XInput and the host,
++# built by the free60/libxenon cross compiler as one big-endian PowerPC image.
++#
++#   cmake -S platform/xbox360 -B build/x360 -DCMAKE_TOOLCHAIN_FILE=platform/xbox360/xenon.toolchain.cmake
++#   cmake --build build/x360
++#
++# The console has no dynamic loader, so the host and the game module are one image: `nebula.xex`. Two targets are built
++# here and the second one needs the game module's own objects, which native/CMakeLists.txt builds with clang and which a
++# cross compiler builds only once the game module's few platform calls are console-shaped (docs/XBOX360.md, "The state of
++# the build").
++#
++#   nebula_x360_platform   the console layer alone: platform, device, audio, window, input. Compiles and links on its
++#                          own, which is what a toolchain bring-up wants first.
++#   nebula_x360            the whole title, when NEBULA_X360_GAME_OBJECTS names the game module's static libraries.
++cmake_minimum_required(VERSION 3.22)
++project(NebulaXbox360 LANGUAGES C CXX)
++
++file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/../../CMakeLists.txt" nebula_project_line REGEX "^project\\(Nebula VERSION ")
++string(REGEX MATCH "[0-9]+\\.[0-9]+\\.[0-9]+" nebula_version "${nebula_project_line}")
++add_compile_definitions(NEBULA_VERSION="${nebula_version}" NEBULA_XBOX360=1)
++
++set(CMAKE_CXX_STANDARD 20)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_CXX_EXTENSIONS OFF)
++
++get_filename_component(nebula_root "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
++set(rt "${nebula_root}/runtime/src")
++set(x360 "${CMAKE_CURRENT_SOURCE_DIR}")
++
++if(NOT XENON_CC)
++    message(WARNING
++        "No xenon-* cross compiler found: pass -DCMAKE_TOOLCHAIN_FILE=platform/xbox360/xenon.toolchain.cmake and "
++        "point XENON_PREFIX at a free60/libxenon toolchain.")
++endif()
++
++# ---- The console layer -------------------------------------------------------------------------------------------
++
++add_library(nebula_x360_platform STATIC
++    "${x360}/xbox360_platform.cpp"
++    "${x360}/xenos_device.cpp"
++    "${x360}/host_window_xbox360.cpp"
++    "${x360}/audio_device_xbox360.cpp"
++    ${rt}/render/display_modes.cpp
++    ${rt}/perf_hint.cpp
++    ${rt}/atomic_file.cpp)
++target_include_directories(nebula_x360_platform PUBLIC
++    "${x360}" "${nebula_root}/runtime/include" "${nebula_root}/native/include")
++if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
++    target_compile_options(nebula_x360_platform PRIVATE /W4 /permissive-)
++else()
++    target_compile_options(nebula_x360_platform PRIVATE -Wall -Wextra -Wno-unused-parameter)
++endif()
++
++# ---- The title ---------------------------------------------------------------------------------------------------
++
++# The game module's objects: native/CMakeLists.txt builds them with clang's GNU driver, and on the console they are linked
++# in rather than loaded. A path list of .a/.o files, semicolon separated.
++set(NEBULA_X360_GAME_OBJECTS "" CACHE STRING "The game module's static libraries to link into nebula.xex")
++set(NEBULA_X360_PROGRAMS "${nebula_root}/build/x360/programs.xsh" CACHE FILEPATH
++    "The Xenos shader blob (tools/dev/compile_programs.py --target xenos)")
++
++if(NOT NEBULA_X360_GAME_OBJECTS)
++    message(STATUS
++        "nebula_x360: the console layer builds; the title needs NEBULA_X360_GAME_OBJECTS (docs/XBOX360.md, "
++        "'The state of the build')")
++    return()
++endif()
++
++add_executable(nebula_x360
++    "${nebula_root}/native/host/host_main.cpp"
++    ${rt}/asset_store.cpp
++    ${rt}/audio_mixer.cpp
++    ${rt}/native_audio.cpp
++    ${rt}/ui_sounds.cpp
++    ${rt}/runtime_settings.cpp
++    ${rt}/save_files.cpp
++    ${rt}/input/host_input.cpp
++    ${rt}/input/controls_engine.cpp
++    ${rt}/input/live_controls_engine.cpp
++    ${rt}/native_input.cpp
++    ${rt}/controller_roster.cpp
++    ${rt}/rumble.cpp
++    ${rt}/render/render_api.cpp
++    ${rt}/render/render_core.cpp
++    ${rt}/render/core/program_table.cpp
++    ${rt}/render/core/registries.cpp)
++target_include_directories(nebula_x360 PRIVATE
++    "${x360}" "${nebula_root}/runtime/include" "${nebula_root}/native/include")
++target_compile_definitions(nebula_x360 PRIVATE NEBULA_HOST_RENDERER=1 NEBULA_HOST_XBOX360=1
++    GALAXY_PROGRAM_BLOB="${NEBULA_X360_PROGRAMS}")
++# libxenon wraps the kernel and the console's libraries in one -lxenon; the SDK route names them, because cl.exe has no
++# umbrella library.
++if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
++    target_link_libraries(nebula_x360 PRIVATE nebula_x360_platform ${NEBULA_X360_GAME_OBJECTS}
++        xboxkrnl xapilib d3d9 xgraphics xaudio2 xinput)
++else()
++    target_link_libraries(nebula_x360 PRIVATE nebula_x360_platform ${NEBULA_X360_GAME_OBJECTS} xenon m)
++    set_target_properties(nebula_x360 PROPERTIES LINK_DEPENDS "${x360}/xbox360.ld")
++endif()
++set_target_properties(nebula_x360 PROPERTIES OUTPUT_NAME nebula SUFFIX ".elf")
++
++# The ELF is what XeLL boots over FTP or USB. A dashboard entry wants a .xex, which the SDK's image tool makes from it:
++add_custom_command(TARGET nebula_x360 POST_BUILD
++    COMMAND ${CMAKE_COMMAND} -E echo
++        "nebula.elf built; package it as a .xex with the XDK's xextool before copying it to Hdd:\\Apps\\Nebula")
+diff --git a/platform/xbox360/audio_device_xbox360.cpp b/platform/xbox360/audio_device_xbox360.cpp
+new file mode 100644
+index 0000000..59e3af5
+--- /dev/null
++++ b/platform/xbox360/audio_device_xbox360.cpp
+@@ -0,0 +1,214 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// The console's sound (audio_device.h): XAudio2's mastering voice at 48 kHz stereo, fed from a ring of buffers the game
++// mixes into on the audio worker's callback. Upstream's mixer writes float frames, so the source voice is IEEE float:
++// no conversion, and the effect bus's headroom survives to the DAC.
++#include "galaxy/audio_device.h"
++
++#include "xbox360_platform.h"
++#include "xbox360_tuning.h"
++
++#include <xaudio2.h>
++
++#include <array>
++#include <atomic>
++#include <cstdio>
++#include <deque>
++#include <mutex>
++#include <vector>
++
++namespace galaxy::host {
++namespace {
++
++// 512 frames a block: 10.7 ms at 48 kHz. Four blocks of ring is 42.7 ms of slack, which hides a frame that runs long
++// without the mixer having to be real-time.
++constexpr std::uint32_t kBlockFrames = 512u;
++constexpr std::uint32_t kBlocks = 4u;
++constexpr std::uint32_t kRate = 48000u;
++constexpr std::uint32_t kChannels = 2u;
++constexpr std::uint32_t kBytesPerFrame = kChannels * static_cast<std::uint32_t>(sizeof(float));
++
++class Xbox360AudioDevice final : public AudioDevice {
++public:
++    ~Xbox360AudioDevice() override { close(); }
++
++    [[nodiscard]] std::uint32_t rate() const override { return kRate; }
++
++    void start(Render render) override {
++        render_ = std::move(render);
++        blocks_.assign(static_cast<std::size_t>(kBlocks) * kBlockFrames * kChannels, 0.0f);
++        {
++            std::lock_guard<std::mutex> lock(mutex_);
++            free_.clear();
++            for (std::uint32_t i = 0; i < kBlocks; ++i) {
++                free_.push_back(static_cast<std::size_t>(i));
++            }
++        }
++        running_.store(true, std::memory_order_release);
++        // Two blocks ahead before the voice starts: the first callback arrives one block-time later, and the mixer has
++        // to be able to fill it with the output never having run dry in between.
++        submit_free_blocks(2u);
++        if (voice_ == nullptr) {
++            return;  // no output: the mixer still pulls, the ring just wraps
++        }
++        (void)voice_->Start(0u, 0u);
++    }
++
++    void set_paused(bool paused) override {
++        if (voice_ == nullptr) {
++            return;
++        }
++        if (paused) {
++            (void)voice_->Stop(0u, 0u);
++        } else {
++            (void)voice_->Start(0u, 0u);
++        }
++    }
++
++    [[nodiscard]] std::uint32_t queued_frames() const override {
++        return playing_.load(std::memory_order_relaxed) * kBlockFrames;
++    }
++
++    void open_engine() {
++        if (FAILED(XAudio2Create(&engine_, 0u, XAUDIO2_DEFAULT_PROCESSOR))) {
++            std::fprintf(stderr, "[audio] XAudio2 refused: no output\n");
++            return;
++        }
++        if (FAILED(engine_->CreateMasteringVoice(&master_, kChannels, kRate, 0u, nullptr, nullptr,
++                                                 AudioCategory_GameEffects))) {
++            std::fprintf(stderr, "[audio] no mastering voice: no output\n");
++            release();
++            return;
++        }
++        WAVEFORMATEX format{};
++        format.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
++        format.nChannels = static_cast<WORD>(kChannels);
++        format.nSamplesPerSec = kRate;
++        format.wBitsPerSample = 32u;
++        format.nBlockAlign = static_cast<WORD>(kBytesPerFrame);
++        format.nAvgBytesPerSec = kRate * format.nBlockAlign;
++        if (FAILED(engine_->CreateSourceVoice(&voice_, &format, 0u, XAUDIO2_DEFAULT_FREQ_RATIO, &callback_, nullptr,
++                                              nullptr))) {
++            std::fprintf(stderr, "[audio] no source voice: no output\n");
++            release();
++        }
++    }
++
++private:
++    // XAudio2's worker: a block has played, so its memory is free and the mixer owes the next one.
++    class Callback final : public IXAudio2VoiceCallback {
++    public:
++        explicit Callback(Xbox360AudioDevice* owner) : owner_(owner) {}
++        void STDMETHODCALLTYPE OnBufferEnd(void* context) override {
++            owner_->block_finished(static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(context)));
++        }
++        void STDMETHODCALLTYPE OnVoiceProcessingPassStart(UINT32) override {}
++        void STDMETHODCALLTYPE OnVoiceProcessingPassEnd() override {}
++        void STDMETHODCALLTYPE OnStreamEnd() override {}
++        void STDMETHODCALLTYPE OnBufferStart(void*) override {}
++        void STDMETHODCALLTYPE OnLoopEnd(void*) override {}
++        void STDMETHODCALLTYPE OnVoiceError(void*, HRESULT) override {}
++
++    private:
++        Xbox360AudioDevice* owner_;
++    };
++
++    void block_finished(std::size_t index) {
++        playing_.fetch_sub(1u, std::memory_order_relaxed);
++        {
++            std::lock_guard<std::mutex> lock(mutex_);
++            free_.push_back(index);
++        }
++        if (running_.load(std::memory_order_acquire)) {
++            submit_free_blocks(1u);
++        }
++    }
++
++    // Fills and submits up to `count` free blocks. Everything under the lock is the ring's bookkeeping; the mix itself
++    // runs outside it, so a long render call cannot stall the callback that is freeing blocks behind it.
++    void submit_free_blocks(std::uint32_t count) {
++        for (std::uint32_t i = 0; i < count; ++i) {
++            std::size_t index = 0u;
++            {
++                std::lock_guard<std::mutex> lock(mutex_);
++                if (free_.empty()) {
++                    return;
++                }
++                index = free_.front();
++                free_.pop_front();
++            }
++            float* const block = blocks_.data() + index * kBlockFrames * kChannels;
++            if (render_) {
++                render_(block, kBlockFrames, kRate);
++            }
++            if (voice_ == nullptr) {
++                std::lock_guard<std::mutex> lock(mutex_);
++                free_.push_back(index);  // no device: the ring stays whole
++                return;
++            }
++            XAUDIO2_BUFFER buffer{};
++            buffer.Flags = 0u;
++            buffer.AudioBytes = kBlockFrames * kBytesPerFrame;
++            buffer.pAudioData = reinterpret_cast<const BYTE*>(block);
++            buffer.pContext = reinterpret_cast<void*>(static_cast<std::uintptr_t>(index));
++            if (FAILED(voice_->SubmitSourceBuffer(&buffer))) {
++                std::lock_guard<std::mutex> lock(mutex_);
++                free_.push_back(index);
++                return;
++            }
++            playing_.fetch_add(1u, std::memory_order_relaxed);
++        }
++    }
++
++    void release() {
++        if (voice_ != nullptr) {
++            (void)voice_->Stop(0u, 0u);
++            voice_->DestroyVoice();
++            voice_ = nullptr;
++        }
++        if (master_ != nullptr) {
++            master_->DestroyVoice();
++            master_ = nullptr;
++        }
++        if (engine_ != nullptr) {
++            engine_->Release();
++            engine_ = nullptr;
++        }
++        playing_.store(0u, std::memory_order_relaxed);
++    }
++
++    void close() {
++        running_.store(false, std::memory_order_release);
++        release();
++        blocks_.clear();
++    }
++
++    IXAudio2* engine_ = nullptr;
++    IXAudio2MasteringVoice* master_ = nullptr;
++    IXAudio2SourceVoice* voice_ = nullptr;
++    Callback callback_{this};
++    Render render_;
++    std::vector<float> blocks_;
++    std::deque<std::size_t> free_;
++    mutable std::mutex mutex_;
++    std::atomic<std::uint32_t> playing_{0u};
++    std::atomic<bool> running_{false};
++};
++
++}  // namespace
++
++std::unique_ptr<AudioDevice> open_audio_device() {
++    // The engine is created here rather than in start() so a title that never reaches the mixer still reports the
++    // console's real output state at boot.
++    auto device = std::make_unique<Xbox360AudioDevice>();
++    device->open_engine();
++    return device;
++}
++
++void set_audio_thread_name() {
++    // The name is the profiler's; the pin is what matters on this machine (xbox360_tuning.h, kThreads.audio).
++    if (!x360::pin_this_thread(x360::kThreads.audio)) {
++        std::fprintf(stderr, "[audio] the kernel kept the mixer off core 3\n");
++    }
++}
++
++}  // namespace galaxy::host
+diff --git a/platform/xbox360/host_window_xbox360.cpp b/platform/xbox360/host_window_xbox360.cpp
+new file mode 100644
+index 0000000..c66ddf5
+--- /dev/null
++++ b/platform/xbox360/host_window_xbox360.cpp
+@@ -0,0 +1,249 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// The game's window on the console (host_window.h): a 1280x720 D3D9 device whose resolved frame the scaler fits to the
++// panel, presents paced by the display's refresh, the pad's exit chord, and the answers the settings menu asks a desktop
++// for (monitors, file pickers, upscalers) that a console does not have.
++//
++// A title owns the machine: there is no window manager, no second monitor and no desktop. The "window" is the device
++// itself (xenos_device.cpp), and its client extent is the frame's.
++#include "galaxy/render/host_window.h"
++
++#include "xbox360_platform.h"
++#include "xbox360_tuning.h"
++#include "xenos_device.h"
++
++#include <d3d9.h>
++#include <xinput.h>
++
++#include <atomic>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++namespace galaxy::render::host_window {
++namespace {
++
++// The handle open_game_window hands the renderer: on a console it identifies the device, not a window.
++struct Device {
++    IDirect3DDevice9* device = nullptr;
++};
++
++Device g_window;
++std::atomic<std::uint64_t> g_present_count{0u};
++std::uint64_t g_present_window_start_us = 0u;
++
++// The dashboard's guide closes a title. To the title that is Start+Back in one poll; two seconds of it is the request.
++constexpr std::uint64_t kExitChordHoldUs = 2000000u;
++std::uint64_t g_exit_chord_since_us = 0u;
++
++void poll_exit_chord() {
++    XINPUT_STATE state{};
++    if (XInputGetState(0u, &state) != ERROR_SUCCESS) {
++        g_exit_chord_since_us = 0u;
++        return;
++    }
++    constexpr WORD kChord = XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_BACK;
++    const bool held = (state.Gamepad.wButtons & kChord) == kChord;
++    const std::uint64_t now = x360::now_us();
++    if (!held) {
++        g_exit_chord_since_us = 0u;
++        return;
++    }
++    if (g_exit_chord_since_us == 0u) {
++        g_exit_chord_since_us = now;
++    } else if (now - g_exit_chord_since_us >= kExitChordHoldUs) {
++        quit_request.store(true, std::memory_order_relaxed);
++    }
++}
++
++}  // namespace
++
++unsigned backbuffer_width = static_cast<unsigned>(x360::kFrameWidth);
++unsigned backbuffer_height = static_cast<unsigned>(x360::kFrameHeight);
++std::atomic<double> measured_present_hz{0.0};
++std::atomic<std::int32_t> pointer_wheel{0};
++std::atomic<bool> borderless_active{true};
++std::atomic<bool> move_size_active{false};
++std::atomic<bool> quit_request{false};
++std::atomic<std::uint64_t> pending_resize_extent{0u};
++std::atomic<bool> surface_withdrawn{false};
++std::timed_mutex surface_use;
++std::atomic<bool> ray_tracing_offered{false};
++std::atomic<bool> rtx_adapter{false};
++
++bool hidden_window_mode_enabled() {
++    return false;  // a title is always on the screen; there is no tray to start hidden in
++}
++
++OpenedWindow open_game_window(WindowOwner&, int window_width, int window_height) {
++    OpenedWindow opened;
++    (void)window_width;
++    (void)window_height;  // the frame is the mode's: 1280x720 at 60 Hz (xbox360_tuning.h)
++    x360::XenosDevice& device = x360::xenos();
++    if (!device.open()) {
++        x360::log_line(nullptr, "[video] the Xenos device did not open");
++        return opened;
++    }
++    g_window.device = device.device();
++    backbuffer_width = static_cast<unsigned>(x360::kFrameWidth);
++    backbuffer_height = static_cast<unsigned>(x360::kFrameHeight);
++    borderless_active.store(true, std::memory_order_relaxed);
++    opened.window = reinterpret_cast<NativeWindow>(&g_window);
++    opened.shown = true;
++    return opened;
++}
++
++IDirect3DDevice9* window_device() {
++    return x360::xenos().device();
++}
++
++void close_game_window(WindowOwner&) noexcept {
++    g_window.device = nullptr;
++    x360::xenos().close();
++}
++
++void show_window(NativeWindow) noexcept {}
++
++double display_refresh_hz(NativeWindow) noexcept {
++    return static_cast<double>(x360::kFrameHz);
++}
++
++void set_state_wake(void* event) noexcept {
++    // A title has no window state to wake on; the guide's chord is polled by the present.
++    (void)event;
++}
++
++bool vblank_grid_known(std::int64_t& vblank, std::int64_t& period) noexcept {
++    // The blank arrives with the present: the grid is one frame at the mode's rate, placed by the last swap.
++    period = 1000000000ll / static_cast<std::int64_t>(x360::kFrameHz);
++    vblank = static_cast<std::int64_t>(x360::xenos().presents() * static_cast<std::uint64_t>(period));
++    return true;
++}
++
++bool vblank_grid(NativeWindow, std::int64_t& vblank, std::int64_t& period) noexcept {
++    return vblank_grid_known(vblank, period);
++}
++
++bool present_grid(std::int64_t& slot_ns, std::int64_t& period_ns, std::int64_t& vsync_ns,
++                  std::int64_t& now_ns) noexcept {
++    // The console's present blocks until the scanout has the frame, so the game's frames are already on the display's
++    // grid: there is nothing for the host to schedule.
++    (void)slot_ns;
++    (void)period_ns;
++    (void)vsync_ns;
++    (void)now_ns;
++    return false;
++}
++
++std::vector<SettingsMonitor> settings_monitors() {
++    // One monitor: the panel the dashboard is on, with the GPU's scaler fitting the title's 1280x720 to it. The settings
++    // menu offers no mode list for it, because the mode is the console's.
++    const x360::Machine machine = x360::machine();
++    SettingsMonitor monitor;
++    monitor.id = "panel";
++    monitor.name = "TV";
++    monitor.width = machine.panel_width;
++    monitor.height = machine.panel_height;
++    monitor.refresh_hz = machine.panel_hz;
++    monitor.max_client_width = static_cast<long>(x360::kFrameWidth);
++    monitor.max_client_height = static_cast<long>(x360::kFrameHeight);
++    monitor.primary = true;
++    return {monitor};
++}
++
++bool window_modal_active() noexcept {
++    return false;
++}
++
++void test_resize_window(unsigned long, unsigned long) noexcept {}
++
++void pick_files(FilePick, std::function<void(std::vector<std::filesystem::path>)> done) {
++    // A console has no file picker. What a picker would return is the package's own layout (game_paths.h): the folders
++    // the install scripts put mods, saves and Miis in.
++    if (done) {
++        done({});
++    }
++}
++
++void open_folder(const std::filesystem::path&) {}
++
++bool folders_open() noexcept {
++    return false;
++}
++
++UpscalerCaps upscaler_caps() noexcept {
++    UpscalerCaps caps;
++    // The console's scaler is the GPU's own: no DLSS, no XeSS, no frame generation, and no vendor files to install.
++    // The port's FSR 1 path is a shader and stays on offer.
++    caps.frames_presented = 1u;
++    return caps;
++}
++
++unsigned dlss_min_width(unsigned, unsigned width, unsigned) noexcept {
++    return width;
++}
++
++bool launcher_available() {
++    return false;
++}
++
++bool dlss_files_present() {
++    return false;
++}
++
++bool xess_files_present() {
++    return false;
++}
++
++bool frame_generation_files_present() {
++    return false;
++}
++
++unsigned vendor_megabytes(unsigned) {
++    return 0u;
++}
++
++bool start_vendor_install(unsigned) {
++    return false;
++}
++
++void cancel_vendor_install() {}
++
++VendorInstall poll_vendor_install(unsigned& percent) {
++    percent = 100u;
++    return VendorInstall::Failed;  // nothing to install: the caps offer nothing that needs files
++}
++
++void fetch_vendor_license(unsigned) {}
++
++VendorLicense vendor_license(std::string& text) {
++    text.clear();
++    return VendorLicense::Failed;
++}
++
++bool restart_game(bool) {
++    // A title restarts by exiting: the dashboard runs it again from the store it came from.
++    quit_request.store(true, std::memory_order_relaxed);
++    return true;
++}
++
++// Ends a frame: the scene's tiles are closed, the multisampled target is resolved into the texture the scaler reads,
++// and the present ties the frame to the panel. The D3D9 renderer calls it once a frame, with the frame already drawn.
++void present_frame() {
++    poll_exit_chord();
++    (void)x360::xenos().resolve_and_present(true);
++    g_present_count.fetch_add(1u, std::memory_order_relaxed);
++    const std::uint64_t now = x360::now_us();
++    if (g_present_window_start_us == 0u) {
++        g_present_window_start_us = now;
++        return;
++    }
++    const std::uint64_t elapsed = now - g_present_window_start_us;
++    if (elapsed >= 1000000u) {
++        const auto frames = g_present_count.exchange(0u, std::memory_order_relaxed);
++        measured_present_hz.store(static_cast<double>(frames) * 1000000.0 / static_cast<double>(elapsed),
++                                  std::memory_order_relaxed);
++        g_present_window_start_us = now;
++    }
++}
++
++}  // namespace galaxy::render::host_window
+diff --git a/platform/xbox360/toolchain-xbox360.cmake b/platform/xbox360/toolchain-xbox360.cmake
+new file mode 100644
+index 0000000..fec326e
+--- /dev/null
++++ b/platform/xbox360/toolchain-xbox360.cmake
+@@ -0,0 +1,39 @@
++# The Xbox 360 SDK's toolchain, as CMake sees it (platform/xbox360/CMakeLists.txt).
++#
++#   XEDK=/c/Xbox360/SDK cmake -S platform/xbox360 -B build/xbox360 \
++#       -DCMAKE_TOOLCHAIN_FILE=platform/xbox360/toolchain-xbox360.cmake -G Ninja
++#
++# The SDK ships a PowerPC-targeted cl.exe, the Xenon libraries, and the umbrella headers. Everything below is read from
++# the SDK's own layout, so a newer drop of the SDK needs no edit here.
++cmake_minimum_required(VERSION 3.22)
++
++set(CMAKE_SYSTEM_NAME Xbox360)
++set(CMAKE_SYSTEM_PROCESSOR xenon)
++
++if(NOT DEFINED ENV{XEDK} OR NOT IS_DIRECTORY "$ENV{XEDK}")
++    message(FATAL_ERROR "Set XEDK to the Xbox 360 SDK's root (the folder holding bin/win32 and include/xbox360).")
++endif()
++set(XEDK "$ENV{XEDK}" CACHE PATH "Xbox 360 SDK root")
++
++# The target we build for: the console, not the SDK's host tools.
++set(XBOX360 ON CACHE BOOL "The Xbox 360 target" FORCE)
++set(CMAKE_C_COMPILER "${XEDK}/bin/win32/cl.exe")
++set(CMAKE_CXX_COMPILER "${XEDK}/bin/win32/cl.exe")
++set(CMAKE_ASM_COMPILER "${XEDK}/bin/win32/cl.exe")
++
++# The Xenon headers and libraries. xbox360 is the console's umbrella set (xtl.h, d3d9.h, xaudio2.h, xinput.h).
++set(X360_INCLUDE "${XEDK}/include/xbox360")
++set(X360_LIB "${XEDK}/lib/xbox360")
++include_directories(SYSTEM "${X360_INCLUDE}")
++link_directories("${X360_LIB}")
++
++# /D_XBOX360 selects the console branches in the SDK's own headers; the ports that matter here are the PowerPC ABI and
++# the VMX (AltiVec) unit upstream's maths already reaches for.
++set(CMAKE_CXX_FLAGS_INIT "/D_XBOX360 /EHsc /GR- /O2 /GS- /fp:fast /arch:SSE2")
++set(CMAKE_C_FLAGS_INIT "/D_XBOX360 /O2 /GS-")
++set(CMAKE_EXE_LINKER_FLAGS_INIT "/LIBPATH:\"${X360_LIB}\"")
++
++set(CMAKE_FIND_ROOT_PATH "${XEDK}")
++set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
++set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
++set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+diff --git a/platform/xbox360/xbox360.ld b/platform/xbox360/xbox360.ld
+new file mode 100644
+index 0000000..8b4573c
+--- /dev/null
++++ b/platform/xbox360/xbox360.ld
+@@ -0,0 +1,96 @@
++/* SPDX-License-Identifier: GPL-3.0-only
++ *
++ * Xenon's memory map for the port's title.
++ *
++ * A Xenon title is a 32-bit big-endian PowerPC executable that XeLL loads at a fixed physical address and enters at
++ * _start: there is no address-space randomisation, no shared objects, and no loader once it runs. The port links at
++ * 0x82000000, which is where libxenon's own loader puts an application -- the low 32 MB belong to the kernel and the
++ * loader, and everything from 0x82000000 up is the title's.
++ *
++ * The kernel keeps 512 MB of physical memory; a title may count on about 480 MB after the hypervisor, the kernel and
++ * the graphics driver's own allocations (xbox360_tuning.h, kUsableMemoryBytes). This script does not model that budget:
++ * the linker places code and read-only data, and everything the game allocates at run time comes from the heap the
++ * platform layer gets from the kernel (xbox360_platform.cpp).
++ */
++
++ENTRY(_start)
++
++MEMORY
++{
++    /* The title's image: 20 MB holds the host, the statically linked game module and the compiled shader blob. */
++    image (rx)  : ORIGIN = 0x82000000, LENGTH = 20M
++    /* The heap: what is left of the 480 MB after the image and the GPU pools. */
++    heap  (rw)  : ORIGIN = 0x83400000, LENGTH = 384M
++}
++
++SECTIONS
++{
++    .text : ALIGN(128)
++    {
++        /* The console's entry: libxenon's crt jumps here with the machine already set up. */
++        KEEP(*(.text.boot))
++        KEEP(*(.text.start))
++        *(.text .text.*)
++        *(.gnu.linkonce.t.*)
++    } > image
++
++    .rodata : ALIGN(128)
++    {
++        *(.rodata .rodata.*)
++        *(.gnu.linkonce.r.*)
++        /* The compiled Xenos programs (nebula_programs_begin, runtime/src/render/core/program_table.cpp). */
++        KEEP(*(.nbprograms))
++        . = ALIGN(128);
++    } > image
++
++    .data : ALIGN(128)
++    {
++        *(.data .data.*)
++        *(.gnu.linkonce.d.*)
++        KEEP(*(.got .got.*))
++        KEEP(*(.got2))          /* PowerPC's small-data GOT: the -fno-pic build still uses it */
++    } > image
++
++    .sdata : ALIGN(32)
++    {
++        *(.sdata .sdata.*)
++        *(.sdata2 .sdata2.*)
++        *(.sbss .sbss.*)
++        *(.sbss2 .sbss2.*)
++    } > image
++
++    .bss (NOLOAD) : ALIGN(128)
++    {
++        __bss_start = .;
++        *(.bss .bss.*)
++        *(.gnu.linkonce.b.*)
++        *(COMMON)
++        . = ALIGN(128);
++        __bss_end = .;
++    } > image
++
++    /* Where the platform's allocator starts (xbox360_platform.cpp reads __heap_start). */
++    _end = .;
++    __heap_start = ORIGIN(heap);
++    __heap_end = ORIGIN(heap) + LENGTH(heap);
++
++    /* The thread-local storage the PowerPC ELF ABI wants: the port's threads each get a block from the platform layer. */
++    .tdata : ALIGN(32) { *(.tdata .tdata.*) } > image
++    .tbss  : ALIGN(32) { *(.tbss .tbss.*) } > image
++
++    /DISCARD/
++    {
++        /* Nothing at run time reads these: the title has no unwinder, no copy relocations and no lazy binding. */
++        *(.interp)
++        *(.dynamic)
++        *(.dynsym)
++        *(.dynstr)
++        *(.hash)
++        *(.gnu.hash)
++        *(.plt .plt.*)
++        *(.iplt)
++        *(.rela.plt)
++        *(.eh_frame_hdr)
++        *(.comment)
++    }
++}
+diff --git a/platform/xbox360/xbox360_apis.h b/platform/xbox360/xbox360_apis.h
+new file mode 100644
+index 0000000..d6e6123
+--- /dev/null
++++ b/platform/xbox360/xbox360_apis.h
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// The Xbox 360 SDK entry points the platform layer calls that have no header of their own in the console's umbrella
++// (xtl.h): the graphics library's swizzle-into-a-tiled-surface call, the video mode, the thread-to-core pin, and the
++// profiler's thread name.
++//
++// The 360's D3D9, XAudio2 and XInput are the same interfaces Windows has and come from their own headers; only these
++// four are declared here. The signatures below are the 360 SDK's (Xbox 360 SDK 2.0.21256.2); if a toolchain's headers
++// give them differently, keep the headers and correct these four declarations -- nothing else in the port names them.
++#pragma once
++
++#if defined(NEBULA_XBOX360)
++
++#include <xtl.h>
++#include <xgraphics.h>
++
++namespace galaxy::host::x360::api {
++
++// Places a rectangle of pixels into a tiled surface: source pitch in bytes (0 keeps the destination's), then the
++// destination, its width and height in texels, and the texel size. The 360's textures are tiled by 32x32 blocks and
++// the driver owns that layout; this is the one call that writes rows into it correctly.
++void XGSwizzleRect(const void* pSource, DWORD pitch, const RECT* pSourceRect, void* pDest, DWORD width, DWORD height,
++                   const RECT* pDestRect, DWORD bytesPerPixel);
++
++// The console's current video mode: the panel's resolution, whether it is interlaced, and the aspect the player's
++// dashboard is set to. A title cannot change it; it renders into it.
++BOOL XGetVideoMode(XVIDEO_MODE* pMode);
++
++// Asks the scaler for the mode the title renders in (1280x720, progressive) -- the panel stays as it is and the GPU's
++// scaler fits the frame to it.
++BOOL XVideoSetMode(WORD width, WORD height, DWORD flags, WORD refresh);
++
++// The core a thread runs on (0-5; core 0 thread 0 is the kernel's). False when the thread has ended.
++BOOL XSetThreadProcessor(HANDLE hThread, DWORD processor);
++
++// The profiler's name for a thread.
++void XSetThreadName(HANDLE hThread, const char* pName);
++
++}  // namespace galaxy::host::x360::api
++
++#endif  // NEBULA_XBOX360
+diff --git a/platform/xbox360/xbox360_platform.cpp b/platform/xbox360/xbox360_platform.cpp
+new file mode 100644
+index 0000000..187b0a9
+--- /dev/null
++++ b/platform/xbox360/xbox360_platform.cpp
+@@ -0,0 +1,171 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// The console itself (xbox360_platform.h): the scaler's mode, the memory the title may still take, the log on the hard
++// disk, and the core a thread runs on. Nothing here draws or makes a sound; it is what the other layers ask the
++// machine for.
++#include "xbox360_platform.h"
++
++#include "xbox360_apis.h"
++#include "xbox360_tuning.h"
++
++#include "galaxy/platform_time.h"
++
++#include <cstdarg>
++#include <cstdio>
++#include <cstring>
++
++namespace galaxy::host::x360 {
++namespace {
++
++// The scaler's mode as the dashboard left it, read once: a title cannot change the panel, only what the GPU's scaler
++// fits onto it.
++struct Panel {
++    std::uint32_t width = 0;
++    std::uint32_t height = 0;
++    std::uint32_t hz = 0;
++    bool widescreen = false;
++    bool interlaced = false;
++};
++
++Panel read_panel() {
++    Panel panel;
++    XVIDEO_MODE mode{};
++    if (api::XGetVideoMode(&mode) == FALSE) {
++        return panel;
++    }
++    panel.width = mode.dwDisplayWidth;
++    panel.height = mode.dwDisplayHeight;
++    panel.hz = mode.dwRefreshRate;
++    panel.widescreen = mode.fIsWideScreen != FALSE;
++    panel.interlaced = mode.fIsInterlaced != FALSE;
++    return panel;
++}
++
++Panel g_panel;
++bool g_video_mode_set = false;
++std::FILE* g_log = nullptr;
++
++}  // namespace
++
++// Reads the machine and logs it: the memory, the panel, the cores. False when the console's video mode could not be
++// read, which on hardware means the title was launched without a display.
++bool start() {
++    // 1280x720 progressive: the EDRAM holds the frame at 2x multisampling in one predicated tile (xbox360_tuning.h),
++    // and the scaler fits it to whatever panel the player's dashboard is on.
++    g_video_mode_set = api::XVideoSetMode(static_cast<WORD>(kFrameWidth), static_cast<WORD>(kFrameHeight), 0u,
++                                          static_cast<WORD>(kFrameHz)) != FALSE;
++    g_panel = read_panel();
++    if (g_panel.width == 0u) {
++        std::fprintf(stderr, "[x360] no video mode: the title was started without a display\n");
++        return false;
++    }
++    const Machine now = machine();
++    std::fprintf(stderr, "[x360] panel %ux%u %u Hz%s%s, %u of %u MB free, %u hardware threads, video mode %s\n",
++                 now.panel_width, now.panel_height, now.panel_hz, now.widescreen ? " wide" : " 4:3",
++                 now.interlaced ? " interlaced" : "", now.memory_free_mb, now.memory_total_mb, kHardwareThreads,
++                 g_video_mode_set ? "1280x720@60" : "the scaler refused, left as found");
++    return true;
++}
++
++Machine machine() {
++    Machine result;
++    MEMORYSTATUS status{};
++    GlobalMemoryStatus(&status);
++    result.memory_total_mb = static_cast<std::uint32_t>(status.dwTotalPhys / (1024u * 1024u));
++    result.memory_free_mb = static_cast<std::uint32_t>(status.dwAvailPhys / (1024u * 1024u));
++    result.panel_width = g_panel.width;
++    result.panel_height = g_panel.height;
++    result.panel_hz = g_panel.hz;
++    result.widescreen = g_panel.widescreen;
++    result.interlaced = g_panel.interlaced;
++    return result;
++}
++
++std::FILE* open_log(const char* path) {
++    if (path == nullptr || path[0] == '\0') {
++        return nullptr;
++    }
++    // A title's working directory is the package's: the log lives beside it, on whichever store the package was started
++    // from (Hdd:, Usb0:, …), so a run on a player's console leaves something to read back.
++    std::FILE* const log = std::fopen(path, "a");
++    if (log == nullptr) {
++        return nullptr;
++    }
++    g_log = log;
++    return log;
++}
++
++// The console's debug channel is the title's stderr (the debug monitor and XeLL both read it); the file is the run's
++// own copy on the store, for a session nobody was watching. A line goes to both.
++void log_line(std::FILE* log, const char* text) noexcept {
++    std::fputs(text, stderr);
++    std::fputc('\n', stderr);
++    if (log == nullptr) {
++        return;
++    }
++    std::fputs(text, log);
++    std::fputc('\n', log);
++    std::fflush(log);
++}
++
++void log_line(std::FILE* log, const char* format, ...) noexcept {
++    char line[1024];
++    std::va_list args;
++    va_start(args, format);
++    std::vsnprintf(line, sizeof(line), format, args);
++    va_end(args);
++    log_line(log, line);
++}
++
++bool pin_this_thread(std::uint32_t processor) {
++    if (processor >= kHardwareThreads) {
++        return false;
++    }
++    return api::XSetThreadProcessor(GetCurrentThread(), processor) != FALSE;
++}
++
++std::uint32_t this_thread_processor() {
++    // The SDK has no getter: a thread's processor is what it was pinned to, and the port pins every thread it starts.
++    // The platform's own work (the boot, the log) runs wherever the kernel put it, so the value is only used for the
++    // report, where 0xFFFFFFFF means "not pinned".
++    return 0xFFFFFFFFu;
++}
++
++std::uint32_t memory_free_bytes() {
++    MEMORYSTATUS status{};
++    GlobalMemoryStatus(&status);
++    const auto free = static_cast<std::uint32_t>(status.dwAvailPhys);
++    // A texture upload in flight holds a frame's worth of staging: hand back what is left after it, never a number the
++    // game could spend twice.
++    const std::uint32_t reserve = 8u * 1024u * 1024u;
++    return free > reserve ? free - reserve : 0u;
++}
++
++std::uint32_t memory_total_bytes() {
++    MEMORYSTATUS status{};
++    GlobalMemoryStatus(&status);
++    return static_cast<std::uint32_t>(status.dwTotalPhys);
++}
++
++std::uint64_t now_us() noexcept {
++    // The time base is 50 MHz, so a microsecond is 50 ticks and the division is exact.
++    return galaxy::xbox360_time_base() / (kTimeBaseHz / 1000000u);
++}
++
++void shutdown() {
++    if (g_log != nullptr) {
++        std::fflush(g_log);
++        std::fclose(g_log);
++        g_log = nullptr;
++    }
++    // The scaler's mode is the dashboard's again: a title that exits leaves the panel as it found it.
++    if (g_video_mode_set) {
++        XVIDEO_MODE mode{};
++        if (api::XGetVideoMode(&mode) != FALSE) {
++            (void)api::XVideoSetMode(static_cast<WORD>(mode.dwDisplayWidth), static_cast<WORD>(mode.dwDisplayHeight),
++                                     0u, static_cast<WORD>(mode.dwRefreshRate));
++        }
++        g_video_mode_set = false;
++    }
++}
++
++}  // namespace galaxy::host::x360
+diff --git a/platform/xbox360/xbox360_platform.h b/platform/xbox360/xbox360_platform.h
+new file mode 100644
+index 0000000..7504ec1
+--- /dev/null
++++ b/platform/xbox360/xbox360_platform.h
+@@ -0,0 +1,49 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// The console, as the port's other layers need it: the boot sequence (the mode the scaler is asked for, the kernel's
++// memory, the log on the hard disk), the core a thread is pinned to, and the memory the frame may still ask for.
++#pragma once
++
++#include <cstdint>
++#include <cstdio>
++
++namespace galaxy::host::x360 {
++
++struct Machine {
++    std::uint32_t memory_total_mb = 0;
++    std::uint32_t memory_free_mb = 0;
++    std::uint32_t panel_width = 0;    // what the scaler is putting the frame on
++    std::uint32_t panel_height = 0;
++    std::uint32_t panel_hz = 0;
++    bool widescreen = false;          // the dashboard's aspect setting
++    bool interlaced = false;
++};
++
++// Reads the machine and logs it: the memory, the panel, the cores. False when the console's video mode could not be
++// read, which on hardware means the title was launched without a display.
++bool start();
++
++// The same read again (a title's free memory moves; the panel can change under it while the guide is up).
++[[nodiscard]] Machine machine();
++
++// `path` opened for append as the run's log ("Hdd:\\Nebula\\nebula.log"); null when it cannot be.
++std::FILE* open_log(const char* path);
++void log_line(std::FILE* log, const char* text) noexcept;
++void log_line(std::FILE* log, const char* format, ...) noexcept;
++
++// Pins the calling thread to a hardware thread of kThreads (xbox360_tuning.h). False when the kernel refused.
++bool pin_this_thread(std::uint32_t processor);
++
++// The hardware thread the caller runs on, 0-5, or 0xFFFFFFFF when the kernel does not say.
++[[nodiscard]] std::uint32_t this_thread_processor();
++
++// What the title may still allocate: the kernel's free bytes, less the reserve a texture upload needs in flight.
++[[nodiscard]] std::uint32_t memory_free_bytes();
++[[nodiscard]] std::uint32_t memory_total_bytes();
++
++// The frame's tick: the console's 50 MHz time base, in microseconds (a whole number, wrapping-safe).
++[[nodiscard]] std::uint64_t now_us() noexcept;
++
++// The run's end: the log closed, the scaler's mode left as it was found.
++void shutdown();
++
++}  // namespace galaxy::host::x360
+diff --git a/platform/xbox360/xbox360_render.h b/platform/xbox360/xbox360_render.h
+new file mode 100644
+index 0000000..49badc1
+--- /dev/null
++++ b/platform/xbox360/xbox360_render.h
+@@ -0,0 +1,20 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// The console's frame, as the D3D9 renderer and the window share it: the device one frame is drawn into, and the
++// present that swaps it onto the scaler. The window owns both; the renderer only asks.
++#pragma once
++
++#if defined(NEBULA_XBOX360)
++
++struct IDirect3DDevice9;
++
++namespace galaxy::render::host_window {
++
++// The device open_game_window made. Null before the window opens and after it closes.
++[[nodiscard]] IDirect3DDevice9* window_device();
++
++// The frame is drawn: waits for the display, then swaps. Called once a frame by the renderer's present.
++void present_frame();
++
++}  // namespace galaxy::render::host_window
++
++#endif  // NEBULA_XBOX360
+diff --git a/platform/xbox360/xbox360_tuning.h b/platform/xbox360/xbox360_tuning.h
+new file mode 100644
+index 0000000..361cc23
+--- /dev/null
++++ b/platform/xbox360/xbox360_tuning.h
+@@ -0,0 +1,90 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// The numbers the Xbox 360 build runs by: what the console gives, how its 512 MB is split between the port's caches,
++// and what one frame of a 60 Hz game may spend. Everything here is a constant of the machine or a budget the port
++// keeps; the player's own settings stay in runtime_settings.ini.
++#pragma once
++
++#include <cstdint>
++
++namespace galaxy::host::x360 {
++
++// ---- The machine -------------------------------------------------------------------------------------------------
++
++inline constexpr std::uint32_t kTimeBaseHz = 50000000u;  // Xenon's time base, all three cores and the GPU
++inline constexpr std::uint32_t kHardwareThreads = 6u;    // three cores, two threads each
++inline constexpr std::uint32_t kConsoleMemoryBytes = 512u * 1024u * 1024u;
++// What a title gets: the hypervisor and the kernel keep the rest. The dashboard's guide is not resident in a title.
++inline constexpr std::uint32_t kUsableMemoryBytes = 480u * 1024u * 1024u;
++inline constexpr std::uint32_t kEdramBytes = 10u * 1024u * 1024u;  // the daughter die's framebuffer
++// One predicated tile, at 720p: half the frame's height, 1280x360, 2x multisampled 32-bit colour plus 2x multisampled
++// 32-bit depth is 7,372,800 bytes (7.03 MiB). Two of those in turn fill the frame and leave the rest of the EDRAM for
++// the resolve.
++inline constexpr std::uint32_t kEdramTileBytes = 7u * 1024u * 1024u;
++
++// ---- The picture -------------------------------------------------------------------------------------------------
++
++// 1280x720 is the console's own HD mode: the GPU's scaler puts it on a 1080p panel, and the EDRAM holds a 32-bit
++// colour target plus a 32-bit depth target at 2x multisampling in two predicated tiles (7.4 MB a tile, 512 KB of the
++// 10 MB spare for the resolve).
++inline constexpr int kFrameWidth = 1280;
++inline constexpr int kFrameHeight = 720;
++inline constexpr int kFrameHz = 60;
++inline constexpr int kMultisample = 2;
++inline constexpr bool kPredicatedTiling = true;
++
++// One frame: 16.67 ms. The game's own share of it, the renderer's submit, and what the display's refresh leaves.
++struct FrameBudget {
++    float game_ms;      // simulation, physics, animation, the game's own draws built
++    float submit_ms;    // command buffer recording and the kick
++    float audio_ms;     // one XAudio pull, on its own thread
++    float slack_ms;
++};
++inline constexpr FrameBudget kFrameBudget{10.5f, 4.0f, 0.8f, 1.3f};
++inline constexpr int kFrameBudgetMs = 16;  // the same, whole, for the frame limiter
++
++// ---- The memory split --------------------------------------------------------------------------------------------
++
++// 480 MB, in the order a frame touches it. A pool is sized once at boot and never grows: the console's allocator
++// fragments under a long session, and the game's own heap is the one that must not.
++struct MemorySplit {
++    std::uint32_t pak_stream_mb;   // the cooked pak's read-ahead and the disc/HDD streaming ring
++    std::uint32_t textures_mb;     // GPU-visible, D3DPOOL_DEFAULT: the scene's textures and the resolve targets
++    std::uint32_t geometry_mb;     // vertex and index buffers, static and per-frame
++    std::uint32_t audio_mb;        // music and effects, plus the XMA decoder's own buffers
++    std::uint32_t game_heap_mb;    // the game module and the host's own allocations
++    std::uint32_t shaders_mb;      // the compiled Xenos shader blobs and the state blocks
++    std::uint32_t spare_mb;
++};
++inline constexpr MemorySplit kMemory{192u, 128u, 48u, 36u, 68u, 4u, 4u};
++
++// ---- Threads -----------------------------------------------------------------------------------------------------
++
++// Core 0 thread 0 belongs to the kernel and the dashboard's guide: the port keeps off it. The two game threads (the
++// host and the game module's own worker) sit on core 2 apart from the renderer's submit, and audio has a core of its
++// own so a long frame cannot starve the mixer.
++struct ThreadPlan {
++    std::uint32_t game_processor;   // the frame's simulation
++    std::uint32_t game_helper;      // the game module's job thread
++    std::uint32_t render;           // command recording and the kick
++    std::uint32_t audio;            // the XAudio render driver
++    std::uint32_t streaming;        // pak reads and texture uploads
++};
++inline constexpr ThreadPlan kThreads{2u, 4u, 5u, 3u, 1u};
++
++// ---- Streaming ---------------------------------------------------------------------------------------------------
++
++// The disc peaks at about 12 MB/s on the outer edge, an installed hard disk at 60 MB/s. A pak read is a 64 KB request
++// with the next four queued behind it, so a level's textures arrive before the frame that wants them.
++inline constexpr std::uint32_t kReadChunkBytes = 64u * 1024u;
++inline constexpr std::uint32_t kReadQueueDepth = 5u;
++inline constexpr std::uint32_t kTextureUploadBytesPerFrame = 2u * 1024u * 1024u;
++
++// ---- The shader cache --------------------------------------------------------------------------------------------
++
++// Xenos runs Shader Model 3.0 vertex and pixel programs; the port's GX programs are the same HLSL compiled for it
++// (tools/dev/compile_programs.py --target xenos, on a Windows host with the SDK's ps_3_0/vs_3_0 compiler). One blob per
++// program and variant, in the package beside the game's data.
++inline constexpr const char* kShaderCacheFile = "programs.xsh";
++inline constexpr std::uint32_t kShaderBlobAlign = 128u;  // the Xenos's shader fetch wants a 128-byte boundary
++
++}  // namespace galaxy::host::x360
+diff --git a/platform/xbox360/xenon.toolchain.cmake b/platform/xbox360/xenon.toolchain.cmake
+new file mode 100644
+index 0000000..b8ad75c
+--- /dev/null
++++ b/platform/xbox360/xenon.toolchain.cmake
+@@ -0,0 +1,86 @@
++# The free60/libxenon cross toolchain, as CMake sees it (platform/xbox360/CMakeLists.txt):
++#
++#   cmake -S platform/xbox360 -B build/x360 \
++#       -DCMAKE_TOOLCHAIN_FILE=platform/xbox360/xenon.toolchain.cmake \
++#       -DXENON_PREFIX=/usr/local/libxenon
++#   cmake --build build/x360 --target nebula_x360_platform
++#
++# The compiler is the free60 port of GCC: `xenon-gcc` / `xenon-g++`, a big-endian PowerPC 970 target. It writes an ELF,
++# which XeLL boots over FTP or a USB stick; the XDK's own cl.exe (toolchain-xbox360.cmake) is the other route, and the
++# only one that produces a .xex for the dashboard.
++#
++# The prefixes below are the ones the libxenon makefile installs to: <prefix>/bin, <prefix>/powerpc-eabi (libxenon's
++# headers and the console's static libraries) and <prefix>/xenon (the console's umbrella headers).
++cmake_minimum_required(VERSION 3.22)
++
++set(CMAKE_SYSTEM_NAME Xbox360)
++set(CMAKE_SYSTEM_PROCESSOR ppc)
++set(CMAKE_SYSTEM_VERSION 1)
++
++get_filename_component(x360_dir "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)
++get_filename_component(x360_root "${x360_dir}/../.." ABSOLUTE)
++
++set(XENON_PREFIX "$ENV{XENON_PREFIX}" CACHE PATH "The free60/libxenon cross toolchain's root")
++if(NOT XENON_PREFIX)
++    set(XENON_PREFIX "/usr/local/libxenon" CACHE PATH "The free60/libxenon cross toolchain's root" FORCE)
++endif()
++if(NOT EXISTS "${XENON_PREFIX}/bin")
++    # A toolchain on PATH (xenon-gcc in /usr/bin) is enough: only the SDK's own prefixes are required then.
++    find_program(XENON_GCC NAMES xenon-gcc PATHS "${XENON_PREFIX}/bin" NO_DEFAULT_PATH)
++else()
++    find_program(XENON_GCC NAMES xenon-gcc PATHS "${XENON_PREFIX}/bin" NO_DEFAULT_PATH)
++endif()
++find_program(XENON_GCC_FALLBACK NAMES xenon-gcc)
++if(NOT XENON_GCC AND XENON_GCC_FALLBACK)
++    set(XENON_GCC "${XENON_GCC_FALLBACK}")
++endif()
++if(NOT XENON_GCC)
++    message(FATAL_ERROR
++        "xenon-gcc was not found. Install the free60/libxenon cross toolchain and point XENON_PREFIX at it "
++        "(docs/XBOX360.md, 'The build').")
++endif()
++get_filename_component(XENON_BIN "${XENON_GCC}" DIRECTORY)
++
++set(CMAKE_C_COMPILER "${XENON_BIN}/xenon-gcc")
++set(CMAKE_CXX_COMPILER "${XENON_BIN}/xenon-g++")
++set(CMAKE_AR "${XENON_BIN}/xenon-ar")
++set(CMAKE_RANLIB "${XENON_BIN}/xenon-ranlib")
++set(CMAKE_OBJCOPY "${XENON_BIN}/xenon-objcopy")
++set(CMAKE_SIZE "${XENON_BIN}/xenon-size")
++
++# libxenon: the console's headers and the static libraries (xboxkrnl, xapilib, d3d9, xgraphics, xaudio2, xinput).
++set(POWERPC_EABI "${XENON_PREFIX}/powerpc-eabi")
++set(XENON_INCLUDE "${XENON_PREFIX}/xenon")
++if(IS_DIRECTORY "${POWERPC_EABI}/include")
++    include_directories(SYSTEM "${POWERPC_EABI}/include")
++endif()
++if(IS_DIRECTORY "${XENON_INCLUDE}")
++    include_directories(SYSTEM "${XENON_INCLUDE}")
++endif()
++
++# Big-endian, no dynamic loader, no exceptions, no RTTI: the machine has none of these and the image is one blob.
++# -mno-altivec stays off: the port's maths reaches for VMX through the SDK's own intrinsics, not the compiler's.
++set(X360_TARGET_FLAGS "-mcpu=cell -m32 -mbig-endian -mhard-float -fno-pic -fno-pie -fno-common")
++set(X360_C_FLAGS "-std=gnu17 -O2 -ffunction-sections -fdata-sections -fno-strict-aliasing ${X360_TARGET_FLAGS}")
++set(X360_CXX_FLAGS
++    "-std=gnu++20 -O2 -ffunction-sections -fdata-sections -fno-exceptions -fno-rtti -fno-threadsafe-statics \
++     -fno-strict-aliasing ${X360_TARGET_FLAGS}")
++set(CMAKE_C_FLAGS_INIT "${X360_C_FLAGS}")
++set(CMAKE_CXX_FLAGS_INIT "${X360_CXX_FLAGS}")
++
++# The linker script places the image at 0x82000000 and the heap after it (xbox360.ld). libxenon's own start files stay:
++# they are what defines _start, sets up the stack and the small-data base, and calls main. -static and --gc-sections
++# because the image is one blob and every byte of it is RAM the game wants back.
++set(CMAKE_EXE_LINKER_FLAGS_INIT
++    "-Wl,-T,${x360_dir}/xbox360.ld -Wl,--gc-sections -static")
++set(CMAKE_SHARED_LIBRARY_LINK_C_FLAGS "")
++set(CMAKE_SHARED_LIBRARY_LINK_CXX_FLAGS "")
++set_property(GLOBAL PROPERTY TARGET_SUPPORTS_SHARED_LIBS FALSE)
++
++set(CMAKE_FIND_ROOT_PATH "${XENON_PREFIX}")
++set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
++set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
++set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
++set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
++
++set(XENON_CC "${XENON_GCC}" CACHE FILEPATH "The cross compiler CMake resolved" FORCE)
+diff --git a/platform/xbox360/xenos_device.cpp b/platform/xbox360/xenos_device.cpp
+new file mode 100644
+index 0000000..f9bd94b
+--- /dev/null
++++ b/platform/xbox360/xenos_device.cpp
+@@ -0,0 +1,259 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// Xenos: the device, the EDRAM scene, the resolve and the present (xenos_device.h).
++//
++// The 360 speaks D3D9 with a handful of its own extensions: the driver keeps render targets in the daughter die's
++// 10 MB, a scene that does not fit is drawn in predicated tiles (BeginTiling/EndTiling), and a multisampled target is
++// resolved into a texture the scaler can read. Those extensions are the SDK's; a toolchain that spells them
++// differently changes these calls and nothing above them.
++#include "xenos_device.h"
++
++#include "xbox360_platform.h"
++#include "xbox360_tuning.h"
++
++#if defined(NEBULA_XBOX360)
++#include "xbox360_apis.h"
++
++#include <cstdio>
++
++namespace galaxy::host::x360 {
++namespace {
++
++D3DFORMAT format_of(TextureDesc::Format format) {
++    switch (format) {
++    case TextureDesc::Format::Bgra8:
++        return D3DFMT_A8R8G8B8;
++    case TextureDesc::Format::Bc1:
++        return D3DFMT_DXT1;
++    case TextureDesc::Format::Bc2:
++        return D3DFMT_DXT3;
++    case TextureDesc::Format::Bc3:
++    case TextureDesc::Format::Dxt5:
++        return D3DFMT_DXT5;
++    case TextureDesc::Format::Rgba8:
++        return D3DFMT_A8B8G8R8;
++    case TextureDesc::Format::R8:
++        return D3DFMT_L8;
++    }
++    return D3DFMT_A8R8G8B8;
++}
++
++std::uint32_t texel_bytes(TextureDesc::Format format) {
++    switch (format) {
++    case TextureDesc::Format::Bgra8:
++    case TextureDesc::Format::Rgba8:
++        return 4u;
++    case TextureDesc::Format::R8:
++        return 1u;
++    case TextureDesc::Format::Bc1:
++    case TextureDesc::Format::Bc2:
++    case TextureDesc::Format::Bc3:
++    case TextureDesc::Format::Dxt5:
++        return 0u;  // 4x4 blocks: the swizzle takes the block size, not a texel
++    }
++    return 4u;
++}
++
++}  // namespace
++
++struct XenosDevice::State {
++    IDirect3D9* d3d = nullptr;
++    IDirect3DDevice9* device = nullptr;
++    IDirect3DTexture9* color = nullptr;
++    IDirect3DSurface9* color_surface = nullptr;
++    IDirect3DTexture9* resolved = nullptr;
++    IDirect3DTexture9* depth = nullptr;
++    std::uint64_t presents = 0u;
++    bool tiling = false;
++    bool open = false;
++};
++
++XenosDevice::XenosDevice() : state_(std::make_unique<State>()) {}
++
++XenosDevice::~XenosDevice() { close(); }
++
++XenosDevice& xenos() {
++    static XenosDevice device;
++    return device;
++}
++
++bool XenosDevice::open() {
++    State& s = *state_;
++    if (s.open) {
++        return true;
++    }
++    s.d3d = Direct3DCreate9(D3D_SDK_VERSION);
++    if (s.d3d == nullptr) {
++        return false;
++    }
++    D3DPRESENT_PARAMETERS present{};
++    present.BackBufferWidth = static_cast<UINT>(kFrameWidth);
++    present.BackBufferHeight = static_cast<UINT>(kFrameHeight);
++    present.BackBufferFormat = D3DFMT_A8R8G8B8;
++    present.BackBufferCount = 2u;
++    present.MultiSampleType = static_cast<D3DMULTISAMPLE_TYPE>(kMultisample);
++    present.MultiSampleQuality = 0u;
++    present.SwapEffect = D3DSWAPEFFECT_DISCARD;
++    // A console has no window: the frame goes to the scaler, which fits it to the panel the dashboard selected.
++    present.Windowed = FALSE;
++    present.EnableAutoDepthStencil = TRUE;
++    present.AutoDepthStencilFormat = D3DFMT_D24S8;
++    present.PresentationInterval = D3DPRESENT_INTERVAL_ONE;
++    // The scaler's mode is the platform's (xbox360_platform.cpp); the device only renders 1280x720 into it.
++    if (FAILED(s.d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, nullptr, D3DCREATE_HARDWARE_VERTEXPROCESSING,
++                                   &present, &s.device))) {
++        return false;
++    }
++    if (s.device->GetRenderTarget(0u, &s.color_surface) != D3D_OK) {
++        return false;
++    }
++    // The resolve target: the same size, one sample, the texture the scaler is handed.
++    if (s.device->CreateTexture(static_cast<UINT>(kFrameWidth), static_cast<UINT>(kFrameHeight), 1u,
++                                D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &s.resolved, nullptr) !=
++        D3D_OK) {
++        return false;
++    }
++    s.open = true;
++    x360::log_line(nullptr, "[xenos] device open: %dx%d, %dx multisample, predicated tiling %s", kFrameWidth,
++                   kFrameHeight, kMultisample, kPredicatedTiling ? "on" : "off");
++    return true;
++}
++
++void XenosDevice::close() {
++    State& s = *state_;
++    if (!s.open) {
++        return;
++    }
++    wait_idle();
++    if (s.resolved != nullptr) {
++        s.resolved->Release();
++        s.resolved = nullptr;
++    }
++    if (s.color_surface != nullptr) {
++        s.color_surface->Release();
++        s.color_surface = nullptr;
++    }
++    if (s.device != nullptr) {
++        s.device->Release();
++        s.device = nullptr;
++    }
++    if (s.d3d != nullptr) {
++        s.d3d->Release();
++        s.d3d = nullptr;
++    }
++    s.open = false;
++}
++
++bool XenosDevice::open_ok() const noexcept { return state_->open; }
++
++IDirect3DDevice9* XenosDevice::device() const noexcept { return state_->device; }
++
++IDirect3DTexture9* XenosDevice::resolved_texture() const noexcept { return state_->resolved; }
++
++void XenosDevice::begin_scene_tiles() {
++    State& s = *state_;
++    if (!kPredicatedTiling || s.device == nullptr || s.tiling) {
++        return;
++    }
++    D3DRECT whole{{0, 0, kFrameWidth, kFrameHeight}};
++    if (SUCCEEDED(s.device->BeginTiling(&whole, 0u))) {
++        s.tiling = true;
++    }
++}
++
++void XenosDevice::end_scene_tiles() {
++    State& s = *state_;
++    if (!s.tiling || s.device == nullptr) {
++        return;
++    }
++    s.device->EndTiling(0u);
++    s.tiling = false;
++}
++
++bool XenosDevice::resolve_and_present(bool vsync) {
++    State& s = *state_;
++    if (!s.open) {
++        return false;
++    }
++    if (s.tiling) {
++        end_scene_tiles();
++    }
++    if (SUCCEEDED(s.device->Resolve(D3DRESOLVE_RENDERTARGET0, nullptr, s.resolved, nullptr, 0u, 0u, nullptr, 1.0f,
++                                   0u, nullptr))) {
++        // The scaler presents the resolved texture; at a 60 Hz title Present ties the frame to the panel.
++        (void)vsync;
++        if (s.device->Present(nullptr, nullptr, nullptr, nullptr) == D3DERR_DEVICELOST) {
++            return false;
++        }
++        ++s.presents;
++        return true;
++    }
++    return false;
++}
++
++IDirect3DTexture9* XenosDevice::create_texture(const TextureDesc& desc) const {
++    State& s = *state_;
++    if (!s.open) {
++        return nullptr;
++    }
++    const DWORD usage = desc.render_target ? D3DUSAGE_RENDERTARGET : 0u;
++    IDirect3DTexture9* pTexture = nullptr;
++    if (FAILED(s.device->CreateTexture(desc.width, desc.height, desc.mips, usage, format_of(desc.format),
++                                       D3DPOOL_DEFAULT, &pTexture, nullptr))) {
++        return nullptr;
++    }
++    return pTexture;
++}
++
++bool XenosDevice::upload_texture(IDirect3DTexture9* pTexture, const TextureDesc& desc, const void* rows,
++                                 std::uint32_t pitch) const {
++    State& s = *state_;
++    if (!s.open || pTexture == nullptr || rows == nullptr) {
++        return false;
++    }
++    const std::uint32_t bytes = texel_bytes(desc.format);
++    std::uint32_t width = desc.width;
++    std::uint32_t height = desc.height;
++    const auto* pRows = static_cast<const unsigned char*>(rows);
++    for (std::uint32_t level = 0; level < desc.mips && level < 32u; ++level) {
++        D3DLOCKED_RECT locked{};
++        if (FAILED(pTexture->LockRect(level, &locked, nullptr, 0u))) {
++            return false;
++        }
++        // The blocks of a compressed level are its width and height in 4x4 cells.
++        const bool compressed = bytes == 0u;
++        const std::uint32_t w = compressed ? (width + 3u) / 4u : width;
++        const std::uint32_t h = compressed ? (height + 3u) / 4u : height;
++        const std::uint32_t texel = compressed ? 8u /* a 4x4 block of DXT1 */ : bytes;
++        api::XGSwizzleRect(pRows, pitch, nullptr, locked.pBits, w, h, nullptr, texel);
++        pTexture->UnlockRect(level);
++        // The next level follows the rows of this one.
++        pRows += static_cast<std::size_t>(pitch) * height;
++        width = width > 1u ? width / 2u : 1u;
++        height = height > 1u ? height / 2u : 1u;
++    }
++    return true;
++}
++
++void XenosDevice::wait_idle() {
++    State& s = *state_;
++    if (s.device == nullptr) {
++        return;
++    }
++    IDirect3DQuery9* pQuery = nullptr;
++    if (FAILED(s.device->CreateQuery(D3DQUERYTYPE_EVENT, &pQuery)) || pQuery == nullptr) {
++        return;
++    }
++    if (SUCCEEDED(pQuery->Issue(D3DISSUE_END))) {
++        // The GPU's own mark: the wait ends when it is reached, which is the queue empty.
++        while (pQuery->GetData(nullptr, 0u, D3DGETDATA_FLUSH) == S_FALSE) {
++            Sleep(0);
++        }
++    }
++    pQuery->Release();
++}
++
++std::uint64_t XenosDevice::presents() const noexcept { return state_->presents; }
++
++}  // namespace galaxy::host::x360
++
++#endif  // NEBULA_XBOX360
+diff --git a/platform/xbox360/xenos_device.h b/platform/xbox360/xenos_device.h
+new file mode 100644
+index 0000000..209edf1
+--- /dev/null
++++ b/platform/xbox360/xenos_device.h
+@@ -0,0 +1,75 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// Xenos: the console's device, its 10 MB of EDRAM, the tile a scene is drawn into, the resolve, and the present that
++// hands the frame to the scaler. The renderer above this (runtime/src/render/) keeps its own command list; this is the
++// device and the swap chain under it, the same role D3D12's device and Vulkan's context play on the other platforms.
++#pragma once
++
++#include <cstdint>
++#include <memory>
++
++#if defined(NEBULA_XBOX360)
++#include <d3d9.h>
++#endif
++
++namespace galaxy::host::x360 {
++
++// What a texture looks like to the uploader: the texel format the frame's shaders sample, the size, and the mips.
++struct TextureDesc {
++    enum class Format : std::uint8_t { Bgra8, Bc1, Bc2, Bc3, Rgba8, R8, Dxt5 };
++    Format format = Format::Bgra8;
++    std::uint32_t width = 0;
++    std::uint32_t height = 0;
++    std::uint32_t mips = 1;
++    bool render_target = false;
++};
++
++class XenosDevice {
++public:
++    XenosDevice();
++    ~XenosDevice();
++    XenosDevice(const XenosDevice&) = delete;
++    XenosDevice& operator=(const XenosDevice&) = delete;
++
++    // Creates the device, the 1280x720 back buffer, the depth buffer and the resolve target the scaler is shown.
++    bool open();
++    void close();
++
++    [[nodiscard]] bool open_ok() const noexcept;
++
++#if defined(NEBULA_XBOX360)
++    [[nodiscard]] IDirect3DDevice9* device() const noexcept;
++    [[nodiscard]] IDirect3DTexture9* resolved_texture() const noexcept;
++#endif
++
++    // A scene larger than the EDRAM holds (colour and depth at 2x multisampling are 14.7 MB of it) is drawn in
++    // predicated tiles: the renderer calls these around its scene passes and the driver clips each one for it.
++    void begin_scene_tiles();
++    void end_scene_tiles();
++
++    // The multisampled target's resolve into `resolved_texture`, then the scaler's present. `vsync` is the frame's
++    // rate tied to the panel's; a 60 Hz title never tears and its frame budget is the period.
++    bool resolve_and_present(bool vsync);
++
++    // A texture the game's own material path can draw: format, size, mips, and the 32x32 tiled layout the Xenos wants
++    // (XGSwizzleRect writes the rows into it; the driver owns the block order).
++#if defined(NEBULA_XBOX360)
++    [[nodiscard]] IDirect3DTexture9* create_texture(const TextureDesc& desc) const;
++    // `rows` is the picture's rows, tightly packed, big-endian, as the cooker wrote them (tools/xbox360/cook.py).
++    bool upload_texture(IDirect3DTexture9* pTexture, const TextureDesc& desc, const void* rows, std::uint32_t pitch) const;
++#endif
++
++    // The device's own wait: the render queue empty before the next frame's targets are rewritten.
++    void wait_idle();
++
++    // Frames the device presented since open(), for the frame limiter and the diagnostics.
++    [[nodiscard]] std::uint64_t presents() const noexcept;
++
++private:
++    struct State;
++    std::unique_ptr<State> state_;
++};
++
++// The device as the renderer's host services see it (runtime/src/render/render_api.cpp's present path).
++[[nodiscard]] XenosDevice& xenos();
++
++}  // namespace galaxy::host::x360
+diff --git a/runtime/include/galaxy/native_audio.h b/runtime/include/galaxy/native_audio.h
+index d433ec0..92def1d 100644
+--- a/runtime/include/galaxy/native_audio.h
++++ b/runtime/include/galaxy/native_audio.h
+@@ -27,6 +27,9 @@ public:
+     void stop();
+     void mix(float gain, std::uint32_t used);
+     void frame();
++    // A sound of the settings menu (ui_sounds.h), from the player's own files: true when it plays, false when the file is
++    // not there and the game should make its own. Any thread.
++    bool ui_sound(std::uint32_t id);
+     // The movie player's sound (nebula_game_api.h movie_audio*).
+     int movie_audio(const void* record, std::uint32_t size);
+     double movie_audio_position();
+diff --git a/runtime/include/galaxy/platform_paths.h b/runtime/include/galaxy/platform_paths.h
+index 773324a..13e6c01 100644
+--- a/runtime/include/galaxy/platform_paths.h
++++ b/runtime/include/galaxy/platform_paths.h
+@@ -36,6 +36,10 @@ namespace galaxy {
+         return {};
+     }
+     return std::filesystem::path(app_data) / L"Nebula";
++#elif defined(NEBULA_XBOX360)
++    // The console's writable store. A game's own saves live on the hard disk; a USB stick's root is the fallback when
++    // the disk's content partition is not there (a console without a disk boots from USB).
++    return std::filesystem::path("Hdd:\\Nebula");
+ #else
+     if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg != nullptr && xdg[0] == '/') {
+         return std::filesystem::path(xdg) / "Nebula";
+@@ -60,7 +64,7 @@ namespace galaxy {
+ 
+ // This process's id (a diagnostics file's name: runs sharing a data folder keep their own).
+ [[nodiscard]] inline unsigned long current_process_id() noexcept {
+-#if defined(_WIN32)
++#if defined(_WIN32) || defined(NEBULA_XBOX360)
+     return static_cast<unsigned long>(GetCurrentProcessId());
+ #else
+     return static_cast<unsigned long>(getpid());
+@@ -72,6 +76,13 @@ namespace galaxy {
+ #if defined(_WIN32)
+     const std::wstring exe = windows::executable_path();
+     return exe.empty() ? std::filesystem::path{} : std::filesystem::path(exe).parent_path();
++#elif defined(NEBULA_XBOX360)
++    // The .xex's own folder: on a console it is where the content was unpacked (D:\Nebula, Hdd:\Apps\Nebula, Usb0:\...).
++    char path[MAX_PATH]{};
++    if (GetModuleFileNameA(nullptr, path, static_cast<DWORD>(sizeof(path))) == 0) {
++        return {};
++    }
++    return std::filesystem::path(path).parent_path();
+ #else
+     std::error_code error;
+     const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", error);
+diff --git a/runtime/include/galaxy/platform_time.h b/runtime/include/galaxy/platform_time.h
+index 305bf93..9fb4ad5 100644
+--- a/runtime/include/galaxy/platform_time.h
++++ b/runtime/include/galaxy/platform_time.h
+@@ -2,23 +2,44 @@
+ #pragma once
+ 
+ // The runtime's high-resolution clock in ticks of qpc_frequency() per second: QueryPerformanceCounter on Windows,
+-// CLOCK_MONOTONIC nanoseconds elsewhere.
++// CLOCK_MONOTONIC nanoseconds elsewhere, Xenon's time base (a 50 MHz counter that both cores and the GPU keep) on
++// Xbox 360.
+ 
+ #include <cstdint>
+ 
+ #if defined(_WIN32)
+ #include "galaxy/windows_api.h"
++#elif defined(NEBULA_XBOX360)
++// Xenon's time base: mftbu/mftb. No header of its own.
+ #else
+ #include <time.h>
+ #endif
+ 
+ namespace galaxy {
+ 
++#if defined(NEBULA_XBOX360)
++// The console's 64-bit time base register. Read in the order the PowerPC requires: the upper word, the lower, and the
++// upper again to catch the carry, else a read landing across the wrap returns a value 4 billion ticks late.
++[[nodiscard]] inline std::uint64_t xbox360_time_base() noexcept {
++    std::uint32_t upper = 0u;
++    std::uint32_t lower = 0u;
++    std::uint32_t again = 0u;
++    do {
++        __asm__ volatile("mftbu %0" : "=r"(upper));
++        __asm__ volatile("mftb %0" : "=r"(lower));
++        __asm__ volatile("mftbu %0" : "=r"(again));
++    } while (upper != again);
++    return (static_cast<std::uint64_t>(upper) << 32u) | lower;
++}
++#endif
++
+ [[nodiscard]] inline std::int64_t qpc_now() noexcept {
+ #if defined(_WIN32)
+     LARGE_INTEGER now{};
+     QueryPerformanceCounter(&now);
+     return now.QuadPart;
++#elif defined(NEBULA_XBOX360)
++    return static_cast<std::int64_t>(xbox360_time_base());
+ #else
+     timespec now{};
+     clock_gettime(CLOCK_MONOTONIC, &now);
+@@ -34,6 +55,8 @@ namespace galaxy {
+         return static_cast<std::int64_t>(value.QuadPart);
+     }();
+     return frequency;
++#elif defined(NEBULA_XBOX360)
++    return 50000000;  // Xenon's time base ticks at 50 MHz, on every core
+ #else
+     return 1000000000;
+ #endif
 diff --git a/runtime/include/galaxy/render/render_config.h b/runtime/include/galaxy/render/render_config.h
 index f1386b9..e028180 100644
 --- a/runtime/include/galaxy/render/render_config.h
@@ -540,6 +2450,285 @@ index f1386b9..e028180 100644
      // Presentation image quality (post_process.h), applied to the presented frame on the render thread; false
      // presents with the plain bilinear blit.
      bool     post_process        = true;
+diff --git a/runtime/include/galaxy/ui_sounds.h b/runtime/include/galaxy/ui_sounds.h
+new file mode 100644
+index 0000000..196ba1f
+--- /dev/null
++++ b/runtime/include/galaxy/ui_sounds.h
+@@ -0,0 +1,55 @@
++// The settings menu's own sounds (nebula_game_api.h ui_sound): short 16-bit WAV files the player keeps beside the
++// game's other data, played by the host's mixer rather than by the game.
++//
++// The game's own effects cannot carry the menu: while it is open the game fades its music and its streams to silence
++// (AudSystem::holdForSettingsMenu), and a sound the player drops in as a mod is a stream. These are mixed straight into
++// the output frame, at the effects volume, so the effects slider and the master both reach them.
++//
++// The files are `<data>/menu-sounds/<role>.wav`, one per role below; a role whose file is missing (or is not 16-bit
++// PCM) stays silent and the game falls back to its own effect.
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++
++namespace galaxy::host {
++
++// The menu's sounds. The host and the game share these numbers (nebula_game_api.h NEBULA_UI_SOUND_*).
++enum UiSoundId : std::uint32_t {
++    kUiSoundFocus = 0,   // the highlight arrives at something
++    kUiSoundSelect = 1,  // a value changes, a mod is dropped
++    kUiSoundPage = 2,    // another page
++    kUiSoundOpen = 3,    // the menu opens
++    kUiSoundClose = 4,   // the menu closes
++    kUiSoundOk = 5,      // a change is applied
++    kUiSoundCount = 6,
++};
++
++class UiSounds {
++public:
++    UiSounds();
++    ~UiSounds();
++    UiSounds(const UiSounds&) = delete;
++    UiSounds& operator=(const UiSounds&) = delete;
++
++    // Reads the WAVs of `<data>/menu-sounds` (runtime_settings_folder), or of `folder` when it is given. Roles whose
++    // file is missing stay silent. Safe to call before any device opens; calling it again replaces what was loaded.
++    void load(const char* folder = nullptr);
++    // The roles this load found, for the log ("focus select page"), empty when it found none.
++    [[nodiscard]] const char* loaded() const;
++
++    // Queues `id` for the next frame. Any thread; safe before the device pulls. True when the file is there (it will be
++    // heard), false when it is not.
++    bool play(std::uint32_t id);
++
++    // Adds every voice queued or still sounding into `out` (interleaved stereo, `frames` long), at a gain ramped from
++    // `gain_start` to `gain_end` across the frame. The device's thread.
++    void mix(float* out, std::size_t frames, std::uint32_t rate, float gain_start, float gain_end);
++
++private:
++    struct State;
++    std::unique_ptr<State> state_;
++};
++
++}  // namespace galaxy::host
+diff --git a/runtime/src/asset_store.cpp b/runtime/src/asset_store.cpp
+index 603cf48..fe8fdd5 100644
+--- a/runtime/src/asset_store.cpp
++++ b/runtime/src/asset_store.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <bit>
+ #include <cctype>
+ #include <cstring>
+ 
+@@ -19,10 +20,83 @@ namespace {
+ 
+ constexpr std::size_t kHeader = 64;
+ 
++// The store is little-endian whatever reads it (cook/store.rs). On a big-endian machine (the Xbox 360's Xenon) the words
++// are byte-reversed on the way out of the index; the tables themselves are converted once, in place
++// (host_index_order), because their fields are only ever read.
++inline constexpr bool kHostIsBigEndian = std::endian::native == std::endian::big;
++
++std::uint32_t tail32(std::uint32_t value) noexcept {
++    if constexpr (!kHostIsBigEndian) {
++        return value;
++    }
++    return (value >> 24u) | ((value >> 8u) & 0x0000ff00u) | ((value << 8u) & 0x00ff0000u) | (value << 24u);
++}
++
++std::uint64_t tail64(std::uint64_t value) noexcept {
++    if constexpr (!kHostIsBigEndian) {
++        return value;
++    }
++    return (static_cast<std::uint64_t>(tail32(static_cast<std::uint32_t>(value))) << 32u) |
++           tail32(static_cast<std::uint32_t>(value >> 32u));
++}
++
++std::uint32_t word32(const std::uint8_t* at) {
++    std::uint32_t value;
++    std::memcpy(&value, at, sizeof(value));
++    return tail32(value);
++}
++
+ std::uint64_t word(const std::uint8_t* at) {
+     std::uint64_t value;
+     std::memcpy(&value, at, sizeof(value));
+-    return value;
++    return tail64(value);
++}
++
++void host_u32(std::uint8_t* at) {
++    std::uint32_t value;
++    std::memcpy(&value, at, sizeof(value));
++    value = tail32(value);
++    std::memcpy(at, &value, sizeof(value));
++}
++
++void host_u64(std::uint8_t* at) {
++    std::uint64_t value;
++    std::memcpy(&value, at, sizeof(value));
++    value = tail64(value);
++    std::memcpy(at, &value, sizeof(value));
++}
++
++// A store's index (the node table, the hash table, the names) brought to the machine's own order: the header's words are
++// read through word()/word32(), and this is the tables' one conversion. Little-endian machines return untouched; a
++// big-endian machine swaps each node's 8- and 4-byte fields and each hash's, leaving the names' bytes alone.
++void host_index_order(std::uint8_t* table, std::uint64_t size, std::uint64_t nodes_at, std::uint64_t hashes_at,
++                      std::uint32_t count) noexcept {
++    if constexpr (!kHostIsBigEndian) {
++        (void)table;
++        (void)size;
++        (void)nodes_at;
++        (void)hashes_at;
++        (void)count;
++        return;
++    }
++    for (std::uint32_t i = 0u; i < count; ++i) {
++        std::uint8_t* const node = table + nodes_at + static_cast<std::uint64_t>(i) * 40u;
++        if (nodes_at + static_cast<std::uint64_t>(i + 1u) * 40u > size) {
++            return;
++        }
++        host_u64(node + 0u);
++        host_u64(node + 8u);
++        for (std::uint32_t field = 16u; field < 40u; field += 4u) {
++            host_u32(node + field);
++        }
++        std::uint8_t* const hash = table + hashes_at + static_cast<std::uint64_t>(i) * 16u;
++        if (hashes_at + static_cast<std::uint64_t>(i + 1u) * 16u > size) {
++            return;
++        }
++        host_u64(hash + 0u);
++        host_u32(hash + 8u);
++        host_u32(hash + 12u);
++    }
+ }
+ 
+ bool is_archive_name(std::string_view part) {
+@@ -111,9 +185,7 @@ void AssetStore::close() {
+ }
+ 
+ bool AssetStore::parse(const std::uint8_t* header, const std::uint8_t* index, std::uint64_t index_at, std::uint64_t size) {
+-    std::uint32_t version, count;
+-    std::memcpy(&version, header + 8, 4);
+-    std::memcpy(&count, header + 12, 4);
++    const std::uint32_t version = word32(header + 8), count = word32(header + 12);
+     const std::uint64_t nodes = word(header + 16), hashes = word(header + 24), names = word(header + 32),
+                         names_size = word(header + 40);
+     if (version != kStoreVersion || count == 0u || nodes < index_at || nodes > size || (size - nodes) / sizeof(Node) < count ||
+@@ -121,8 +193,18 @@ bool AssetStore::parse(const std::uint8_t* header, const std::uint8_t* index, st
+         size - names < names_size || names_size == 0u || index[names - index_at + names_size - 1u] != 0u) {
+         return false;
+     }
+-    const auto* const node_table = reinterpret_cast<const Node*>(index + (nodes - index_at));
+-    const auto* const hash_table = reinterpret_cast<const Hash*>(index + (hashes - index_at));
++    // A big-endian machine reads the tables in its own order, from the copy the store already keeps; the little-endian
++    // ones point straight into the mapping and convert nothing.
++    const std::uint8_t* table = index;
++    if constexpr (kHostIsBigEndian) {
++        if (table != index_.data()) {
++            index_.assign(index, index + (size - index_at));
++        }
++        host_index_order(index_.data(), size - index_at, nodes - index_at, hashes - index_at, count);
++        table = index_.data();
++    }
++    const auto* const node_table = reinterpret_cast<const Node*>(table + (nodes - index_at));
++    const auto* const hash_table = reinterpret_cast<const Hash*>(table + (hashes - index_at));
+     // Every index the table holds is inside it, so a damaged file is refused here and nothing below checks again (read checks each
+     // read against the store's size).
+     for (std::uint32_t i = 0u; i < count; ++i) {
+@@ -135,7 +217,7 @@ bool AssetStore::parse(const std::uint8_t* header, const std::uint8_t* index, st
+     }
+     nodes_ = node_table;
+     hashes_ = hash_table;
+-    names_ = reinterpret_cast<const char*>(index + (names - index_at));
++    names_ = reinterpret_cast<const char*>(table + (names - index_at));
+     count_ = count;
+     game_id_.assign(reinterpret_cast<const char*>(header + 48), strnlen(reinterpret_cast<const char*>(header + 48), 6));
+     revision_ = header[55];
+diff --git a/runtime/src/native_audio.cpp b/runtime/src/native_audio.cpp
+index ecce990..bce07a4 100644
+--- a/runtime/src/native_audio.cpp
++++ b/runtime/src/native_audio.cpp
+@@ -9,6 +9,7 @@
+ #include "galaxy/path_text.h"
+ #include "galaxy/platform_time.h"
+ #include "galaxy/runtime_settings.h"
++#include "galaxy/ui_sounds.h"
+ #include "galaxy/wiimote_speaker.h"
+ 
+ #include <algorithm>
+@@ -329,6 +330,8 @@ std::unique_ptr<AudioDevice> open_null_audio_device(std::uint32_t rate) {
+ struct NativeGameAudio::State {
+     std::unique_ptr<AudioDevice> device;
+     std::unique_ptr<galaxy::audio::AudioMixer> mixer;
++    // The settings menu's sounds (ui_sounds.h), from the player's own files.
++    UiSounds ui;
+     AudioWavDump wav;
+     float master{1.0f};
+     bool master_started{};
+@@ -337,6 +340,9 @@ struct NativeGameAudio::State {
+     std::vector<float> speaker_frame;  // the remote speaker's frame on its own, while `audible` ramps
+     galaxy::SoundOutput sound_output{galaxy::SoundOutput::Stereo};
+     std::vector<std::byte> wav_block;
++    // What the WAV dump holds so far, so a take can be read back with each menu sound placed in it.
++    std::uint64_t dump_frames{};
++    std::uint32_t dump_rate{};
+     // The frames made and not yet pulled, interleaved; the device's thread only. Center, surround left and right apart
+     // from them while the device has rear speakers.
+     std::vector<float> pending;
+@@ -439,6 +445,11 @@ void NativeGameAudio::setup(NebulaVoice* voices, std::uint32_t count, const Nebu
+     s.mixer->setup(voices, count, effects);
+     const galaxy::RuntimeAudioSettings audio = galaxy::get_runtime_settings().audio;
+     s.mixer->set_category_gains({1.0f, audio.music, audio.voice, audio.sfx, audio.ambience, audio.cutscene});
++    // The settings menu's sounds: the player's own, from beside the game's data (ui_sounds.h).
++    s.ui.load();
++    if (const char* const found = s.ui.loaded(); found[0] != '\0') {
++        std::cerr << "[audio] menu sounds: " << found << '\n';
++    }
+ }
+ 
+ void NativeGameAudio::start(std::function<void()> tick) {
+@@ -461,6 +472,17 @@ void NativeGameAudio::mix(float gain, std::uint32_t used) {
+     }
+ }
+ 
++bool NativeGameAudio::ui_sound(std::uint32_t id) {
++    State& s = *state_;
++    const bool queued = s.ui.play(id);
++    // The dump is a test's take: name the moment of the sound in it, so the file can be read back at that sample.
++    if (s.dump_frames != 0u && s.dump_rate != 0u) {
++        std::fprintf(stderr, "[read] menu sound %u at dump %.3f s\n", id,
++                     static_cast<double>(s.dump_frames) / static_cast<double>(s.dump_rate));
++    }
++    return queued;
++}
++
+ // The frame: the master volume (ramped across the frame from the last one's), the remote speaker, the output's samples.
+ void NativeGameAudio::frame() {
+     if (state_->mixer == nullptr) {
+@@ -522,6 +544,9 @@ void NativeGameAudio::frame() {
+             out[i * 2u + 1u] += s.speaker_frame[i * 2u + 1u] * gain;
+         }
+     }
++    // The menu's sounds last, at the effects volume and through the same master ramp as the game's own, so the volume
++    // sliders and the background mute reach them like everything else. Mixed before the mono fold, so that reaches them too.
++    s.ui.mix(out.data(), frames, s.mixer->rate(), start * audio.sfx, target * audio.sfx);
+     if (audio.sound_output == galaxy::SoundOutput::Mono) {
+         for (std::size_t i = 0; i < frames; ++i) {
+             const float both = 0.5f * (out[i * 2u] + out[i * 2u + 1u]);
+@@ -545,6 +570,8 @@ void NativeGameAudio::frame() {
+             s.wav_block[i * 2u + 1u] = static_cast<std::byte>(bits >> 8u);
+         }
+         (void)s.wav.append(s.wav_block, s.mixer->rate());
++        s.dump_frames += frames;
++        s.dump_rate = s.mixer->rate();
+     }
+     for (float& value : out) {
+         value = std::clamp(value, -1.0f, 1.0f);
 diff --git a/runtime/src/render/core/draw_walker.cpp b/runtime/src/render/core/draw_walker.cpp
 index 82ad286..944865a 100644
 --- a/runtime/src/render/core/draw_walker.cpp
@@ -716,3 +2905,271 @@ index caf02a7..86be189 100644
      return rows;
  }
  
+diff --git a/runtime/src/ui_sounds.cpp b/runtime/src/ui_sounds.cpp
+new file mode 100644
+index 0000000..923419f
+--- /dev/null
++++ b/runtime/src/ui_sounds.cpp
+@@ -0,0 +1,262 @@
++// The settings menu's sounds: `data/menu-sounds/<role>.wav` loaded once, mixed into the output frame (ui_sounds.h).
++//
++// A clip is held as interleaved stereo floats at its own rate, played by linear interpolation from the game's thread to
++// the device's. The sounds are a few hundred milliseconds long, so the interpolation's error stays under a millisecond
++// of delay at any device rate, and there is no filter to ring on a blip.
++#include "galaxy/ui_sounds.h"
++
++#include "galaxy/runtime_settings.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <iterator>
++#include <mutex>
++#include <string>
++#include <vector>
++
++namespace galaxy::host {
++namespace {
++
++// One per role, in UiSoundId's order. The loader looks for `<role>.wav`.
++constexpr const char* kRoleNames[] = {"focus", "select", "page", "open", "close", "ok"};
++static_assert(std::size(kRoleNames) == kUiSoundCount, "one file name per role");
++
++// Queued and sounding at once. Radial menu blips never come close; a stuck queue is capped rather than growing.
++constexpr std::size_t kVoices = 8;
++
++constexpr float kSfxGain = 1.0f;  // the effects bus is already `audio.sfx`; the clip plays at its own level
++
++struct Clip {
++    std::vector<float> samples;  // interleaved stereo
++    std::uint32_t rate = 0;
++    std::uint32_t frames = 0;
++
++    [[nodiscard]] bool ok() const { return rate != 0 && frames != 0; }
++};
++
++std::uint32_t read_le32(const unsigned char* p) {
++    return static_cast<std::uint32_t>(p[0]) | static_cast<std::uint32_t>(p[1]) << 8 |
++           static_cast<std::uint32_t>(p[2]) << 16 | static_cast<std::uint32_t>(p[3]) << 24;
++}
++
++std::uint16_t read_le16(const unsigned char* p) {
++    return static_cast<std::uint16_t>(static_cast<std::uint16_t>(p[0]) | static_cast<std::uint16_t>(p[1]) << 8);
++}
++
++// A RIFF/WAVE file's `data` chunk as interleaved stereo floats. False with `why` set for anything but 8- or 16-bit PCM
++// (the menu's files are 16-bit; anything else is left out rather than resampled wrong).
++bool read_wav(const std::filesystem::path& path, Clip* pClip, std::string* pWhy) {
++    std::ifstream file(path, std::ios::binary);
++    if (!file) {
++        *pWhy = "cannot be opened";
++        return false;
++    }
++    std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
++    if (bytes.size() < 12u || std::memcmp(bytes.data(), "RIFF", 4) != 0 || std::memcmp(bytes.data() + 8, "WAVE", 4) != 0) {
++        *pWhy = "is not a RIFF/WAVE file";
++        return false;
++    }
++    unsigned format = 0;
++    unsigned channels = 0;
++    unsigned bits = 0;
++    std::uint32_t rate = 0;
++    const unsigned char* pData = nullptr;
++    std::size_t dataBytes = 0;
++    std::size_t at = 12u;
++    while (at + 8u <= bytes.size()) {
++        const unsigned char* const pChunk = bytes.data() + at;
++        const std::uint32_t size = read_le32(pChunk + 4);
++        const std::size_t body = at + 8u;
++        if (body > bytes.size()) {
++            break;
++        }
++        const std::size_t available = std::min<std::size_t>(size, bytes.size() - body);
++        if (std::memcmp(pChunk, "fmt ", 4) == 0 && available >= 16u) {
++            format = read_le16(bytes.data() + body);
++            channels = read_le16(bytes.data() + body + 2);
++            rate = read_le32(bytes.data() + body + 4);
++            bits = read_le16(bytes.data() + body + 14);
++            // WAVE_FORMAT_EXTENSIBLE: the real format is the first two bytes of the sub-format's GUID.
++            if (format == 0xFFFEu && available >= 26u) {
++                format = read_le16(bytes.data() + body + 24);
++            }
++        } else if (std::memcmp(pChunk, "data", 4) == 0) {
++            pData = bytes.data() + body;
++            dataBytes = available;
++        }
++        at = body + available + (available & 1u);  // chunks sit on even boundaries
++    }
++    if (format != 1u) {
++        *pWhy = "is not PCM";
++        return false;
++    }
++    if (channels != 1u && channels != 2u) {
++        *pWhy = "has more than two channels";
++        return false;
++    }
++    if (bits != 8u && bits != 16u) {
++        *pWhy = "is not 8- or 16-bit";
++        return false;
++    }
++    if (pData == nullptr || rate == 0u) {
++        *pWhy = "has no samples";
++        return false;
++    }
++    const std::size_t bytesPerSample = bits / 8u;
++    const std::uint32_t frames = static_cast<std::uint32_t>(dataBytes / (bytesPerSample * channels));
++    if (frames == 0u) {
++        *pWhy = "has no samples";
++        return false;
++    }
++    pClip->rate = rate;
++    pClip->frames = frames;
++    pClip->samples.assign(static_cast<std::size_t>(frames) * 2u, 0.0f);
++    for (std::uint32_t i = 0; i < frames; ++i) {
++        for (unsigned channel = 0; channel < 2u; ++channel) {
++            const unsigned from = channels == 2u ? channel : 0u;
++            const unsigned char* const pSample = pData + (static_cast<std::size_t>(i) * channels + from) * bytesPerSample;
++            const float value = bits == 16u
++                ? static_cast<float>(static_cast<std::int16_t>(read_le16(pSample))) / 32768.0f
++                : (static_cast<float>(pSample[0]) - 128.0f) / 128.0f;
++            pClip->samples[static_cast<std::size_t>(i) * 2u + channel] = value;
++        }
++    }
++    return true;
++}
++
++}  // namespace
++
++struct UiSounds::State {
++    Clip clips[kUiSoundCount];
++    char loaded[64] = {};
++
++    // The device's thread: queued plays wait here until its next frame takes them.
++    std::mutex lock;
++    std::vector<std::uint32_t> queued;
++
++    struct Voice {
++        const Clip* pClip = nullptr;
++        double position = 0.0;  // in the clip's own frames
++        bool playing = false;
++        std::uint64_t started = 0;
++    };
++    Voice voices[kVoices];
++    std::uint64_t started = 0;
++    // Set when the device changes rate: every voice's step is worked out per frame, so nothing to redo.
++};
++
++UiSounds::UiSounds() : state_(std::make_unique<State>()) {}
++UiSounds::~UiSounds() = default;
++
++void UiSounds::load(const char* folder) {
++    State& s = *state_;
++    std::filesystem::path dir;
++    if (folder != nullptr && folder[0] != '\0') {
++        dir = std::filesystem::path(folder);
++    } else {
++        dir = galaxy::runtime_settings_folder() / "menu-sounds";
++    }
++    std::string found;
++    for (std::uint32_t id = 0; id < kUiSoundCount; ++id) {
++        Clip& rClip = s.clips[id];
++        rClip = Clip{};
++        const std::filesystem::path path = dir / (std::string(kRoleNames[id]) + ".wav");
++        std::error_code error;
++        if (!std::filesystem::is_regular_file(path, error)) {
++            continue;
++        }
++        std::string why;
++        if (!read_wav(path, &rClip, &why)) {
++            std::fprintf(stderr, "[audio] the menu sound %s %s: left out\n", path.string().c_str(), why.c_str());
++            continue;
++        }
++        if (!found.empty()) {
++            found += ' ';
++        }
++        found += kRoleNames[id];
++    }
++    std::snprintf(s.loaded, sizeof(s.loaded), "%s", found.c_str());
++}
++
++const char* UiSounds::loaded() const {
++    return state_->loaded;
++}
++
++bool UiSounds::play(std::uint32_t id) {
++    if (id >= kUiSoundCount || !state_->clips[id].ok()) {
++        return false;
++    }
++    const std::lock_guard<std::mutex> guard(state_->lock);
++    if (state_->queued.size() >= kVoices) {
++        return true;  // already as many waiting as can sound; the newest tick is the one that matters
++    }
++    state_->queued.push_back(id);
++    return true;
++}
++
++void UiSounds::mix(float* out, std::size_t frames, std::uint32_t rate, float gain_start, float gain_end) {
++    State& s = *state_;
++    if (frames == 0u || rate == 0u) {
++        return;
++    }
++    {
++        const std::lock_guard<std::mutex> guard(s.lock);
++        for (const std::uint32_t id : s.queued) {
++            State::Voice* pVoice = nullptr;
++            for (State::Voice& rVoice : s.voices) {
++                if (!rVoice.playing) {
++                    pVoice = &rVoice;
++                    break;
++                }
++            }
++            if (pVoice == nullptr) {
++                // Full: the oldest gives way, so that the newest press is always heard.
++                pVoice = &s.voices[0];
++                for (State::Voice& rVoice : s.voices) {
++                    if (rVoice.started < pVoice->started) {
++                        pVoice = &rVoice;
++                    }
++                }
++            }
++            pVoice->pClip = &s.clips[id];
++            pVoice->position = 0.0;
++            pVoice->playing = true;
++            pVoice->started = ++s.started;
++        }
++        s.queued.clear();
++    }
++    for (State::Voice& rVoice : s.voices) {
++        if (!rVoice.playing || rVoice.pClip == nullptr) {
++            continue;
++        }
++        const Clip& rClip = *rVoice.pClip;
++        const double step = static_cast<double>(rClip.rate) / static_cast<double>(rate);
++        const std::size_t last = rClip.frames - 1u;
++        for (std::size_t i = 0; i < frames; ++i) {
++            if (rVoice.position >= static_cast<double>(last)) {
++                rVoice.playing = false;
++                break;
++            }
++            const auto whole = static_cast<std::size_t>(rVoice.position);
++            const float fraction = static_cast<float>(rVoice.position - static_cast<double>(whole));
++            const std::size_t next = whole + 1u < rClip.frames ? whole + 1u : whole;
++            const float gain = gain_start + (gain_end - gain_start) * static_cast<float>(i) / static_cast<float>(frames);
++            const float scale = gain * kSfxGain;
++            for (unsigned channel = 0; channel < 2u; ++channel) {
++                const float a = rClip.samples[whole * 2u + channel];
++                const float b = rClip.samples[next * 2u + channel];
++                out[i * 2u + channel] += (a + (b - a) * fraction) * scale;
++            }
++            rVoice.position += step;
++        }
++        if (rVoice.position >= static_cast<double>(last)) {
++            rVoice.playing = false;
++        }
++    }
++}
++
++}  // namespace galaxy::host

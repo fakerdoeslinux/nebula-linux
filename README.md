@@ -2,7 +2,8 @@
 
 A ready-to-run Linux build of [Nebula](https://github.com/keepvaibin/nebula), the decompilation of *Super Mario
 Galaxy*, plus the source changes this port needs — the Linux port itself, an F10 options menu, the menu's deep-blue
-art and an FPS counter — with build scripts and a desktop entry.
+art, its six sounds and an FPS counter — with build scripts, a desktop entry, and an Xbox 360 target for modded
+consoles with its own art set.
 
 No Wine. No emulator. The game's code is compiled to a native Linux binary and runs on SDL3 + Vulkan.
 
@@ -20,7 +21,11 @@ $ ./scripts/build-linux.sh ~/Games/Super\ Mario\ Galaxy.rvz
 | `scripts/build-linux.sh` | one-command build: dependencies, host, game module, importer, install |
 | `scripts/run-nebula.sh` | launcher (sets up the shader cache, finds the module and content) |
 | `scripts/set-video.sh` | resolution, aspect, upscaler and frame cap, written to `config.ini` |
-| `scripts/install-app.sh` | application-menu entry, icon, desktop shortcut, Plasma task-bar pin |
+| `scripts/install-app.sh` | application-menu entry, icon, desktop shortcut, Plasma task-bar pin, menu sounds |
+| `scripts/build-xbox360.sh` | Xbox 360 build: the console layer today, the whole image once the game module does |
+| `scripts/install-x360.sh` | writes the 360 package and its art onto a console's drive |
+| `docs/XBOX360.md` | the 360 port: the machine's numbers, the budgets, the art, what runs and what does not |
+| `tools/xbox360/art.py` | draws the 360 art set: cover, background, tile, banner, icons, disc label |
 | `patches/0001-linux-port.patch` | the source changes: the Linux port, the F10 menu, the menu art and the FPS counter |
 | `tools/CMakeLists.txt` | builds `galaxy_native_spirv` / `galaxy_utility_spirv` (upstream builds these on Windows only) |
 | `assets/nebula-smg.svg` | the app icon |
@@ -69,6 +74,11 @@ keeps it closed, and Esc or F10 puts it away.
 
 The window is drawn in the blues of *New Super Mario Bros. Wii*'s menus — navy fill, sky-blue rim, gold for the row
 under the cursor — inside the game's own layout system, so it keeps its shape at any aspect ratio.
+
+The menu's six sounds (row focus, select, page, open, close, OK) are the game's own Wii system sounds, played by the
+host when the row changes and mixed into the output frame under the master and SFX volumes. `scripts/install-app.sh`
+puts them in `~/Documents/nebula-game/data/menu-sounds`; take them away and the menu falls back to the game's own
+`MR::startSystemSE` calls, which is quieter but still audible.
 
 The FPS counter (DISPLAY ▸ INTERFACE ▸ FPS COUNTER) is drawn in Super Mario Galaxy's own message font on the game's
 information window, pinned to the screen's top left, above every other 2D element. The number is the renderer's
@@ -244,6 +254,39 @@ cmake --build build\host --target NebulaNative          # add -DNEBULA_VULKAN=ON
 
 The patches in this repo are Linux-only and are not needed on Windows. `common.key` is the Wii common key that the
 importer needs for encrypted disc images; it is not distributed here.
+
+## Xbox 360
+
+The same port, aimed at a modded 360 (RGH/JTAG): one big-endian PowerPC image, the console's own D3D9 device (Xenos)
+for the picture, XAudio2 for the sound, XInput for the pads. `docs/XBOX360.md` is the long version — the memory split,
+the thread plan, the shader route and an honest table of what is written, what is compiled and what has run on
+hardware (short answer: nothing has, there is no console here).
+
+```bash
+./scripts/build-xbox360.sh                      # the console layer: platform, Xenos device, XAudio2, window
+./scripts/install-x360.sh /run/media/$USER/Hdd1 # the package and its art onto the drive
+```
+
+The numbers it runs by, from `platform/xbox360/xbox360_tuning.h`:
+
+| | |
+|---|---|
+| picture | 1280×720, 2× MSAA, drawn in predicated tiles through the 10 MB of EDRAM, resolved and scaled once |
+| memory | 480 MB: 192 pak stream, 128 textures, 48 geometry, 36 audio, 68 game heap, 4 shaders, 4 spare |
+| threads | game on core 2, audio on core 3, render on core 5, streaming on core 1 — core 0 stays the kernel's |
+| frame | 16.67 ms: 10.5 simulation, 4.0 submit, 0.8 audio, 1.3 slack |
+
+The art is drawn from scratch by `tools/xbox360/art.py` — cover, dashboard background, list tile, banner, icons, a
+12 cm disc label and a title screen — and installed to the title-id folders Aurora and Freestyle Dash read. No
+Nintendo artwork is used or traced.
+
+| | |
+|---|---|
+| `assets/xbox360/boxart.png` | 584×700, the cover |
+| `assets/xbox360/background.png` | 1280×720, the dashboard background |
+| `assets/xbox360/tile.png` / `banner.png` | 219×300 / 1000×250 |
+| `assets/xbox360/icon.png` / `icon-64.png` | 100×100 / 64×64 |
+| `assets/xbox360/disc.png` / `splash.png` | a 12 cm disc label at 300 dpi / the title screen |
 
 ## OpenGL and Rust — the straight answer
 
